@@ -1,39 +1,53 @@
-# Passo a Passo: Compilando TensorFlow 2.21 no Power9 (ppc64le)
+# Step-by-Step: Compiling TensorFlow 2.21 on Power9 (ppc64le)
 
-Execute os blocos abaixo um por vez no terminal da sua VM Power9.
+Execute the blocks below one at a time in the terminal of your Power9 VM.
 
-### Passo 1: Instalar dependências
+### Step 0: Configure Environment Variables
+Before starting, set the directory where TensorFlow will be downloaded and compiled, and the base path of your Conda installation (Miniforge or Anaconda).
+
+```bash
+export TF_BUILD_DIR="${TF_BUILD_DIR:-$PWD/tf221_workspace}"
+export CONDA_BASE="${CONDA_BASE:-$HOME/miniforge3}"
+
+mkdir -p $TF_BUILD_DIR
+```
+
+### Step 1: Install dependencies
+TensorFlow requires C/C++ compilation tools and basic system utilities. This command installs everything AlmaLinux (or RedHat) needs to process and compile the code.
+
 ```bash
 sudo dnf install -y git gcc gcc-c++ zip unzip which patch wget vim-common
 ```
 
-### Passo 2: Criar o ambiente Conda
-Como você compilou o Bazel manualmente no `/usr/local/bin`, nós NÃO instalaremos o Bazel pelo conda. Apenas Python e pacotes base!
+### Step 2: Create the Conda environment
+Since you compiled Bazel manually in `/usr/local/bin`, we will NOT install Bazel through conda. Only Python and base packages!
 
 ```bash
-source /root/miniforge3/etc/profile.d/conda.sh
+source $CONDA_BASE/etc/profile.d/conda.sh
 conda create -n tf221_build "python=3.11" numpy wheel packaging requests -c conda-forge -y
 conda activate tf221_build
 ```
 
-### Passo 3: Clonar o código-fonte do TensorFlow 2.21
-Se a pasta `tensorflow` já existir, delete-a primeiro (`rm -rf tensorflow`) e faça o git clone de novo.
+### Step 3: Clone TensorFlow 2.21 source code
+If the `tensorflow` folder already exists, delete it first (`rm -rf tensorflow`) and git clone again.
 
 ```bash
-cd /home/almalinux/tensorflow221
+cd $TF_BUILD_DIR
 rm -rf tensorflow
 git clone --depth 1 --branch v2.21.0 https://github.com/tensorflow/tensorflow.git
 cd tensorflow
 ```
 
-### Passo 4: Limpar configs antigos de Bazel
+### Step 4: Clean old Bazel configs
+To ensure there are no remnants of old or unsuccessful builds, we clean the Bazel cache. Deleting the `.bazelversion` file ensures that the system uses our already installed native version.
+
 ```bash
 rm -f .bazelversion
 bazel clean --expunge
 ```
 
-### Passo 5: Configurar as variáveis de ambiente (O Pulo do Gato)
-Copie e cole este bloco inteiro no terminal de uma vez:
+### Step 5: Configure environment variables (The Secret Sauce)
+The TensorFlow configuration script (`./configure`) asks several questions. By exporting these variables, we answer everything in advance: we disable GPU support, disable mobile platforms, and force the use of GCC optimized to avoid instructions that break on Power9 (`-mno-float128`). Copy and paste this entire block into the terminal:
 
 ```bash
 export CC=gcc
@@ -51,12 +65,14 @@ export PYTHON_LIB_PATH=$(python3 -c 'import site; print(site.getsitepackages()[0
 export TF_CONFIGURE_IOS=0
 ```
 
-### Passo 6: Rodar o Configure
+### Step 6: Run Configure
+Starts the initial project configuration. The `echo` followed by `\n` simulates the "Enter" key being pressed repeatedly, accepting all default options quickly.
+
 ```bash
 echo -e "\n\n\n\n\n\n\n\n\n\n" | ./configure
 ```
 
-### Passo 7: Corrigir o Bug "local.bzl" do rules_ml_toolchain
+### Step 7: Fix the "local.bzl" bug in rules_ml_toolchain
 O Bazel 7.1.0 removeu o arquivo `local.bzl`. Vamos baixar o pacote problemático, consertá-lo e depois usá-lo localmente:
 
 ```bash
@@ -67,19 +83,19 @@ tar -xzf rules.tar.gz
 mv rules_ml_toolchain-d8cb9c2c168cd64000eaa6eda0781a9615a26ffe rules_ml_toolchain_patched
 sed -i '/load("@bazel_tools\/\/tools\/build_defs\/repo:local.bzl", "new_local_repository")/d' rules_ml_toolchain_patched/cc/deps/cc_toolchain_deps.bzl
 sed -i 's/new_local_repository(/native.new_local_repository(/g' rules_ml_toolchain_patched/cc/deps/cc_toolchain_deps.bzl
-cd /home/almalinux/tensorflow221/tensorflow
+cd $TF_BUILD_DIR/tensorflow
 ```
 
-### Passo 8: Criar LLVM Stub Repos (NOVO — Evita download de LLVM)
+### Step 8: Create LLVM Stub Repos (NEW — Prevents LLVM download)
 O `rules_ml_toolchain` tenta baixar binários do LLVM/Clang para x86_64 e aarch64, que obviamente não rodam no Power9. A solução é criar repositórios "stub" vazios e injetá-los via `--override_repository`:
 
 ```bash
 # --- LLVM stub ---
-mkdir -p /root/llvm_stub
-echo 'VERSION = "0.0.0"' > /root/llvm_stub/version.bzl
-touch /root/llvm_stub/WORKSPACE
+mkdir -p $HOME/llvm_stub
+echo 'VERSION = "0.0.0"' > $HOME/llvm_stub/version.bzl
+touch $HOME/llvm_stub/WORKSPACE
 
-cat > /root/llvm_stub/BUILD << 'EOF'
+cat > $HOME/llvm_stub/BUILD << 'EOF'
 filegroup(name = "all", srcs = [], visibility = ["//visibility:public"])
 filegroup(name = "clang", srcs = [], visibility = ["//visibility:public"])
 filegroup(name = "clang++", srcs = [], visibility = ["//visibility:public"])
@@ -93,16 +109,16 @@ cc_library(name = "cuda_wrappers_headers", hdrs = [], visibility = ["//visibilit
 EOF
 
 # --- CUDA stub (local_config_cuda) ---
-mkdir -p /root/cuda_stub/cuda
-touch /root/cuda_stub/WORKSPACE
-cat > /root/cuda_stub/BUILD << 'EOF'
+mkdir -p $HOME/cuda_stub/cuda
+touch $HOME/cuda_stub/WORKSPACE
+cat > $HOME/cuda_stub/BUILD << 'EOF'
 package(default_visibility = ["//visibility:public"])
 config_setting(name = "is_cuda_enabled", values = {"define": "stub=true"})
 config_setting(name = "is_cuda_compiler_present", values = {"define": "stub=true"})
 filegroup(name = "LICENSE", srcs = [])
 EOF
 
-cat > /root/cuda_stub/cuda/BUILD << 'EOF'
+cat > $HOME/cuda_stub/cuda/BUILD << 'EOF'
 package(default_visibility = ["//visibility:public"])
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load(":build_defs.bzl", "cuda_header_library")
@@ -143,15 +159,15 @@ config_setting(name = "cuda_tools", values = {"define": "stub=false"})
 config_setting(name = "cuda_tools_and_libs", values = {"define": "stub=false"})
 EOF
 
-# Subpasta crosstool para o cuda_stub
-mkdir -p /root/cuda_stub/crosstool
-cat > /root/cuda_stub/crosstool/BUILD << 'EOF'
+# crosstool subfolder for cuda_stub
+mkdir -p $HOME/cuda_stub/crosstool
+cat > $HOME/cuda_stub/crosstool/BUILD << 'EOF'
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "toolchain", srcs = [])
 filegroup(name = "toolchain-linux-x86_64", srcs = [])
 EOF
 
-cat > /root/cuda_stub/cuda/build_defs.bzl << 'EOF'
+cat > $HOME/cuda_stub/cuda/build_defs.bzl << 'EOF'
 def if_cuda(if_true, if_false = []):
     return if_false
 def if_cuda_is_configured(if_true=[], if_false=[], *args, **kwargs):
@@ -182,37 +198,37 @@ def if_gpu_is_configured(if_true=[], if_false=[], *args, **kwargs):
     return if_false
 EOF
 
-# Criar um cuda_config.h vazio
-touch /root/cuda_stub/cuda/cuda_config.h
+# Create an empty cuda_config.h
+touch $HOME/cuda_stub/cuda/cuda_config.h
 
 # --- NCCL stub (local_config_nccl) ---
-mkdir -p /root/nccl_stub/nccl
-touch /root/nccl_stub/WORKSPACE
-cat > /root/nccl_stub/BUILD << 'EOF'
+mkdir -p $HOME/nccl_stub/nccl
+touch $HOME/nccl_stub/WORKSPACE
+cat > $HOME/nccl_stub/BUILD << 'EOF'
 package(default_visibility = ["//visibility:public"])
 cc_library(name = "nccl_config", hdrs = [], visibility = ["//visibility:public"])
 EOF
 
-cat > /root/nccl_stub/nccl/BUILD << 'EOF'
+cat > $HOME/nccl_stub/nccl/BUILD << 'EOF'
 package(default_visibility = ["//visibility:public"])
 cc_library(name = "nccl", srcs = [], visibility = ["//visibility:public"])
 EOF
 
-cat > /root/nccl_stub/nccl/build_defs.bzl << 'EOF'
+cat > $HOME/nccl_stub/nccl/build_defs.bzl << 'EOF'
 def if_nccl(if_true, if_false = []):
     return if_false
 EOF
 
-# --- CUDA redistribution stub (genérico para cuda_cudart, cuda_nvcc, etc.) ---
-mkdir -p /root/cuda_redist_stub
-touch /root/cuda_redist_stub/WORKSPACE
-echo 'VERSION = "0.0.0"' > /root/cuda_redist_stub/version.bzl
-cat > /root/cuda_redist_stub/versions.bzl << 'EOF'
+# --- CUDA redistribution stub (generic for cuda_cudart, cuda_nvcc, etc.) ---
+mkdir -p $HOME/cuda_redist_stub
+touch $HOME/cuda_redist_stub/WORKSPACE
+echo 'VERSION = "0.0.0"' > $HOME/cuda_redist_stub/version.bzl
+cat > $HOME/cuda_redist_stub/versions.bzl << 'EOF'
 NVIDIA_WHEEL_VERSIONS = {
     "0.0.0": [],
 }
 EOF
-cat > /root/cuda_redist_stub/BUILD << 'EOF'
+cat > $HOME/cuda_redist_stub/BUILD << 'EOF'
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "all", srcs = [], visibility = ["//visibility:public"])
 cc_library(name = "headers", hdrs = [], visibility = ["//visibility:public"])
@@ -220,9 +236,9 @@ cc_library(name = "libs", srcs = [], visibility = ["//visibility:public"])
 EOF
 
 # --- TensorRT stub ---
-mkdir -p /root/tensorrt_stub
-touch /root/tensorrt_stub/WORKSPACE
-cat > /root/tensorrt_stub/BUILD << 'EOF'
+mkdir -p $HOME/tensorrt_stub
+touch $HOME/tensorrt_stub/WORKSPACE
+cat > $HOME/tensorrt_stub/BUILD << 'EOF'
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "LICENSE", srcs = [])
 cc_library(name = "tensorrt_headers", hdrs = [])
@@ -231,7 +247,7 @@ config_setting(name = "use_static_tensorrt", values = {"define": "stub=true"})
 py_library(name = "tensorrt_config_py", srcs = [])
 EOF
 
-cat > /root/tensorrt_stub/build_defs.bzl << 'EOF'
+cat > $HOME/tensorrt_stub/build_defs.bzl << 'EOF'
 def if_tensorrt(if_true, if_false = []):
     return if_false
 def is_tensorrt_configured():
@@ -241,15 +257,15 @@ def if_tensorrt_exec(if_true, if_false = []):
 EOF
 
 # --- ROCm stub ---
-mkdir -p /root/rocm_stub/rocm
-touch /root/rocm_stub/WORKSPACE
-cat > /root/rocm_stub/BUILD << 'EOF'
+mkdir -p $HOME/rocm_stub/rocm
+touch $HOME/rocm_stub/WORKSPACE
+cat > $HOME/rocm_stub/BUILD << 'EOF'
 package(default_visibility = ["//visibility:public"])
 config_setting(name = "is_rocm_enabled", values = {"define": "stub=true"})
 filegroup(name = "LICENSE", srcs = [])
 EOF
 
-cat > /root/rocm_stub/rocm/BUILD << 'EOF'
+cat > $HOME/rocm_stub/rocm/BUILD << 'EOF'
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "all_files", srcs = [])
 filegroup(name = "build_defs", srcs = [])
@@ -277,14 +293,14 @@ config_setting(name = "using_hipcc", values = {"define": "stub=false"})
 config_setting(name = "linux_x64", values = {"define": "stub=false"})
 EOF
 
-# Subpasta crosstool para o rocm_stub
-mkdir -p /root/rocm_stub/crosstool
-cat > /root/rocm_stub/crosstool/BUILD << 'EOF'
+# crosstool subfolder for rocm_stub
+mkdir -p $HOME/rocm_stub/crosstool
+cat > $HOME/rocm_stub/crosstool/BUILD << 'EOF'
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "toolchain", srcs = [])
 EOF
 
-cat > /root/rocm_stub/rocm/build_defs.bzl << 'EOF'
+cat > $HOME/rocm_stub/rocm/build_defs.bzl << 'EOF'
 def if_rocm(if_true, if_false = []):
     return if_false
 def if_rocm_is_configured(if_true=[], if_false=[], *args, **kwargs):
@@ -320,18 +336,19 @@ def rocm_library(**kwargs):
 EOF
 ```
 
-### Passo 9: Criar PyPI Stub e Python Stub
+### Step 9: Create PyPI Stub and Python Stub
+The build system (Bazel) is strict and tries to download isolated Python packages, but these pre-compiled versions do not work on Power9. To work around this, we create empty "fake" files (stubs) on the machine, tricking Bazel into believing it downloaded them, but forcing it to use the actual Python libraries we already installed in our Conda environment (Step 2).
 
 ```bash
 # --- PyPI stub (para bibliotecas Pip herméticas) ---
-mkdir -p /root/pypi_stub
-touch /root/pypi_stub/WORKSPACE
-cat > /root/pypi_stub/BUILD << 'EOF'
+mkdir -p $HOME/pypi_stub
+touch $HOME/pypi_stub/WORKSPACE
+cat > $HOME/pypi_stub/BUILD << 'EOF'
 package(default_visibility = ["//visibility:public"])
 py_library(name = "pkg", srcs = [])
 EOF
 
-cat > /root/pypi_stub/requirements.bzl << 'EOF'
+cat > $HOME/pypi_stub/requirements.bzl << 'EOF'
 def requirement(name):
     normalized = name.replace("-", "_").lower()
     return "@@pypi//" + normalized
@@ -340,18 +357,18 @@ def install_deps(**kwargs):
 EOF
 
 for pkg in astor astunparse dill gast h5py jax lit numpy opt_einsum packaging portpicker protobuf requests scipy tblib termcolor typing_extensions wrapt zstandard; do
-  mkdir -p /root/pypi_stub/$pkg
-  cat > /root/pypi_stub/$pkg/BUILD << EOF
+  mkdir -p $HOME/pypi_stub/$pkg
+  cat > $HOME/pypi_stub/$pkg/BUILD << EOF
 package(default_visibility = ["//visibility:public"])
 py_library(name = "$pkg", srcs = [])
 py_library(name = "pkg", srcs = [])
 EOF
 done
 
-# Numpy precisa de headers C
+# Numpy needs C headers
 NUMPY_INC=$(python3 -c "import numpy; print(numpy.get_include())")
-ln -sf "$NUMPY_INC" /root/pypi_stub/numpy/numpy_include
-cat > /root/pypi_stub/numpy/BUILD << 'EOF'
+ln -sf "$NUMPY_INC" $HOME/pypi_stub/numpy/numpy_include
+cat > $HOME/pypi_stub/numpy/BUILD << 'EOF'
 package(default_visibility = ["//visibility:public"])
 cc_library(
     name = "numpy_headers",
@@ -362,10 +379,10 @@ py_library(name = "numpy", srcs = [])
 EOF
 
 # --- Python stub (python_3_11_host) ---
-mkdir -p /root/python_stub
-touch /root/python_stub/WORKSPACE
-ln -sf /root/miniforge3/envs/tf221_build/bin/python3 /root/python_stub/python3_bin
-cat > /root/python_stub/BUILD << 'EOF'
+mkdir -p $HOME/python_stub
+touch $HOME/python_stub/WORKSPACE
+ln -sf $CONDA_BASE/envs/tf221_build/bin/python3 $HOME/python_stub/python3_bin
+cat > $HOME/python_stub/BUILD << 'EOF'
 package(default_visibility = ["//visibility:public"])
 exports_files(["python3_bin"])
 filegroup(name = "python", srcs = ["python3_bin"])
@@ -375,12 +392,12 @@ cc_library(name = "python_headers", hdrs = [])
 EOF
 
 # --- Python config stub (local_config_python) ---
-mkdir -p /root/python_config_stub
-touch /root/python_config_stub/WORKSPACE
+mkdir -p $HOME/python_config_stub
+touch $HOME/python_config_stub/WORKSPACE
 PYINC=$(python3 -c "import sysconfig; print(sysconfig.get_path('include'))")
-ln -sf "$PYINC" /root/python_config_stub/python_include
+ln -sf "$PYINC" $HOME/python_config_stub/python_include
 
-cat > /root/python_config_stub/py_cc_toolchain.bzl << 'EOF'
+cat > $HOME/python_config_stub/py_cc_toolchain.bzl << 'EOF'
 def _py_cc_toolchain_impl(ctx):
     if ctx.attr.headers:
         cc_info = ctx.attr.headers[CcInfo]
@@ -407,7 +424,7 @@ py_cc_toolchain = rule(
 )
 EOF
 
-cat > /root/python_config_stub/BUILD << 'EOF'
+cat > $HOME/python_config_stub/BUILD << 'EOF'
 package(default_visibility = ["//visibility:public"])
 load("@bazel_tools//tools/python:toolchain.bzl", "py_runtime_pair")
 load(":py_cc_toolchain.bzl", "py_cc_toolchain")
@@ -457,11 +474,11 @@ config_setting(
 )
 EOF
 
-### Passo 9: Patch do WORKSPACE (NOVO — Desabilitar toolchain LLVM)
-Precisamos comentar as chamadas que tentam registrar as toolchains LLVM hermetic:
+### Step 9.1: WORKSPACE Patch (NEW — Disable LLVM toolchain)
+The project's central dependency file (`WORKSPACE`) tries to register GPU tools and compilers for x86_64 architectures that will break our build. This step runs a Python script that reads this file and automatically comments out (disables) all problematic dependency blocks.
 
 ```bash
-cd /home/almalinux/tensorflow221/tensorflow
+cd $TF_BUILD_DIR/tensorflow
 
 cat > /tmp/patch_workspace3.py << 'PYEOF'
 """
@@ -554,21 +571,20 @@ PYEOF
 python3 /tmp/patch_workspace3.py
 ```
 
-### Passo 10: Desativar o Python "Hermético" do Google (CRÍTICO para ppc64le)
-O TF 2.21 tenta baixar um Python pré-compilado pelo Google, mas ele NÃO existe para Power9.
-Vamos aplicar 3 patches cirúrgicos no código-fonte:
+### Step 10: Disable Google's "Hermetic" Python (CRITICAL for ppc64le)
+**This is the most intense step.** TensorFlow contains dozens of false assumptions about the environment (like assuming there is a "hermetic" Python pre-compiled by Google for Power9) and bugs with modern compilers (GCC 13+). Below, we will execute several surgical fixes (patches) that modify TensorFlow files on the fly, removing incompatibilities.
 
-**10A — Criar wrapper Python** (resolve o bug do PYTHONHOME errado):
+**10A — Create Python wrapper** (fixes the wrong PYTHONHOME bug):
 ```bash
-cat > /root/python3_bazel.sh << 'EOF'
+cat > $HOME/python3_bazel.sh << 'EOF'
 #!/bin/bash
 unset PYTHONHOME
-exec /root/miniforge3/envs/tf221_build/bin/python3 "$@"
+exec $CONDA_BASE/envs/tf221_build/bin/python3 "$@"
 EOF
-chmod +x /root/python3_bazel.sh
+chmod +x $HOME/python3_bazel.sh
 ```
 
-**10B — Desabilitar download do Python hermético:**
+**10B — Disable hermetic Python download:**
 ```bash
 cat > /tmp/patch_toolchains.py << 'PYEOF'
 import re
@@ -608,7 +624,7 @@ content = content.replace(
     '''        python_interpreter_target = "@{}_host//:python".format(
             get_toolchain_name_per_python_version("python"),
         ),''',
-    '        python_interpreter = "/root/python3_bazel.sh",  # ppc64le: wrapper that unsets PYTHONHOME'
+    '        python_interpreter = "$HOME/python3_bazel.sh",  # ppc64le: wrapper that unsets PYTHONHOME'
 )
 
 with open(path, "w") as f:
@@ -905,7 +921,8 @@ print("OK: Super-Patch V2 aplicado com sucesso!")
 PYEOF
 ```
 
-### Passo 11: Corrigir Bug do Bazel 7 no tensorflow.bzl
+### Step 11: Fix Bazel 7 bug in tensorflow.bzl
+TensorFlow 2.21 was designed for older versions of Bazel. When compiling with the new Bazel 7, environment transitions generate a bug. This patch fixes the responsible `.bzl` file by removing the conflicting rules.
 
 ```bash
 python3 - << 'PYEOF'
@@ -928,15 +945,16 @@ print("OK: tensorflow.bzl patched")
 PYEOF
 ```
 
-### Passo 11.1: Patch pybind11_bazel — Remover `-fvisibility=hidden` globalmente
-> **Causa Raiz:** O macro `pybind_library` em `pybind11_bazel/build_defs.bzl` injeta
-> `-fvisibility=hidden` em **todos** os pacotes pybind11 (`pybind11_protobuf`, `pybind11_abseil`,
+### Step 11.1: Patch pybind11_bazel — Remove `-fvisibility=hidden` globally
+TensorFlow hides certain C++ functions by default so as not to pollute programs, but on Power9 this prevents the Python library from finding the compiled functions. This Python script enters the `pybind11` rules and alters them to make everything visible.
+> **Root Cause:** The `pybind_library` macro in `pybind11_bazel/build_defs.bzl` injects
+> `-fvisibility=hidden` into **all** pybind11 packages (`pybind11_protobuf`, `pybind11_abseil`,
 > etc), ganhando de `--copt=-fvisibility=default`. A correção definitiva é remover essa flag
 > direto da raiz. **Requer que o cache do Bazel já esteja populado** (rode após um `bazel build`
 > ou fetch prévio).
 
 ```bash
-cd /home/almalinux/tensorflow221/tensorflow
+cd $TF_BUILD_DIR/tensorflow
 
 # Desinstalar TF instalado (evita conflito no ExtractAPI step)
 pip uninstall tensorflow -y || true
@@ -993,8 +1011,10 @@ print("=== Todos os patches de visibilidade aplicados! ===")
 PYEOF
 ```
 
-### Passo 12: Iniciar a Compilação Master
-**Atenção:** Esse passo vai levar de 4 a 8 horas.
+### Step 12: Start Master Compilation
+The moment of truth has arrived. This giant command calls Bazel and instructs it to compile the entire project from scratch, pointing to all the "fake" folders (stubs) we created to bypass incompatible dependencies. It will use all processor cores (`--jobs=$(nproc)`).
+
+**Attention:** This step is heavy and will take 4 to 8 hours depending on your VM. Go grab a coffee!
 
 ```bash
 bazel build \
@@ -1006,76 +1026,76 @@ bazel build \
     --cxxopt=-fvisibility=default \
     --copt=-DPYBIND11_EXPORT="__attribute__((visibility(\"default\")))" \
     --extra_toolchains=@@local_config_python//:py_cc_toolchain \
-    --override_repository=rules_ml_toolchain=/root/rules_ml_toolchain_patched \
-    --override_repository=llvm_linux_x86_64=/root/llvm_stub \
-    --override_repository=llvm_linux_aarch64=/root/llvm_stub \
-    --override_repository=llvm_darwin_aarch64=/root/llvm_stub \
-    --override_repository=llvm18_linux_x86_64=/root/llvm_stub \
-    --override_repository=llvm19_linux_x86_64=/root/llvm_stub \
-    --override_repository=llvm20_linux_x86_64=/root/llvm_stub \
-    --override_repository=llvm21_linux_x86_64=/root/llvm_stub \
-    --override_repository=llvm18_linux_aarch64=/root/llvm_stub \
-    --override_repository=llvm20_linux_aarch64=/root/llvm_stub \
-    --override_repository=llvm21_linux_aarch64=/root/llvm_stub \
-    --override_repository=llvm18_darwin_aarch64=/root/llvm_stub \
-    --override_repository=llvm20_darwin_aarch64=/root/llvm_stub \
-    --override_repository=local_config_cuda=/root/cuda_stub \
-    --override_repository=local_config_nccl=/root/nccl_stub \
-    --override_repository=local_config_tensorrt=/root/tensorrt_stub \
-    --override_repository=local_config_rocm=/root/rocm_stub \
-    --override_repository=cuda_cudart=/root/cuda_redist_stub \
-    --override_repository=cuda_profiler_api=/root/cuda_redist_stub \
-    --override_repository=cuda_nvcc=/root/cuda_redist_stub \
-    --override_repository=cuda_nvml=/root/cuda_redist_stub \
-    --override_repository=cuda_nvtx=/root/cuda_redist_stub \
-    --override_repository=cuda_cccl=/root/cuda_redist_stub \
-    --override_repository=cuda_cudnn=/root/cuda_redist_stub \
-    --override_repository=cuda_cudnn9=/root/cuda_redist_stub \
-    --override_repository=cuda_cublas=/root/cuda_redist_stub \
-    --override_repository=cuda_cusolver=/root/cuda_redist_stub \
-    --override_repository=cuda_cusparse=/root/cuda_redist_stub \
-    --override_repository=cuda_curand=/root/cuda_redist_stub \
-    --override_repository=cuda_cufft=/root/cuda_redist_stub \
-    --override_repository=cuda_cupti=/root/cuda_redist_stub \
-    --override_repository=cuda_nvdisasm=/root/cuda_redist_stub \
-    --override_repository=cuda_nvvm=/root/cuda_redist_stub \
-    --override_repository=cuda_nvjitlink=/root/cuda_redist_stub \
-    --override_repository=nvidia_wheel_versions=/root/cuda_redist_stub \
-    --override_repository=pypi=/root/pypi_stub \
-    --override_repository=pypi_absl_py=/root/pypi_stub \
-    --override_repository=pypi_astunparse=/root/pypi_stub \
-    --override_repository=pypi_auditwheel=/root/pypi_stub \
-    --override_repository=pypi_flatbuffers=/root/pypi_stub \
-    --override_repository=pypi_gast=/root/pypi_stub \
-    --override_repository=pypi_keras=/root/pypi_stub \
-    --override_repository=pypi_lit=/root/pypi_stub \
-    --override_repository=pypi_ml_dtypes=/root/pypi_stub \
-    --override_repository=pypi_mods=/root/pypi_stub \
-    --override_repository=pypi_numpy=/root/pypi_stub \
-    --override_repository=pypi_nvidia_cublas_cu12=/root/pypi_stub \
-    --override_repository=pypi_nvidia_cuda_cupti_cu12=/root/pypi_stub \
-    --override_repository=pypi_nvidia_cuda_nvcc_cu12=/root/pypi_stub \
-    --override_repository=pypi_nvidia_cuda_nvrtc_cu12=/root/pypi_stub \
-    --override_repository=pypi_nvidia_cuda_runtime_cu12=/root/pypi_stub \
-    --override_repository=pypi_nvidia_cudnn_cu12=/root/pypi_stub \
-    --override_repository=pypi_nvidia_cufft_cu12=/root/pypi_stub \
-    --override_repository=pypi_nvidia_curand_cu12=/root/pypi_stub \
-    --override_repository=pypi_nvidia_cusolver_cu12=/root/pypi_stub \
-    --override_repository=pypi_nvidia_cusparse_cu12=/root/pypi_stub \
-    --override_repository=pypi_nvidia_nccl_cu12=/root/pypi_stub \
-    --override_repository=pypi_nvidia_nvjitlink_cu12=/root/pypi_stub \
-    --override_repository=pypi_nvidia_nvshmem_cu12=/root/pypi_stub \
-    --override_repository=pypi_opt_einsum=/root/pypi_stub \
-    --override_repository=pypi_packaging=/root/pypi_stub \
-    --override_repository=pypi_protobuf=/root/pypi_stub \
-    --override_repository=pypi_requests=/root/pypi_stub \
-    --override_repository=pypi_setuptools=/root/pypi_stub \
-    --override_repository=pypi_termcolor=/root/pypi_stub \
-    --override_repository=pypi_typing_extensions=/root/pypi_stub \
-    --override_repository=pypi_wheel=/root/pypi_stub \
-    --override_repository=pypi_wrapt=/root/pypi_stub \
-    --override_repository=python_3_11_host=/root/python_stub \
-    --override_repository=local_config_python=/root/python_config_stub \
+    --override_repository=rules_ml_toolchain=$HOME/rules_ml_toolchain_patched \
+    --override_repository=llvm_linux_x86_64=$HOME/llvm_stub \
+    --override_repository=llvm_linux_aarch64=$HOME/llvm_stub \
+    --override_repository=llvm_darwin_aarch64=$HOME/llvm_stub \
+    --override_repository=llvm18_linux_x86_64=$HOME/llvm_stub \
+    --override_repository=llvm19_linux_x86_64=$HOME/llvm_stub \
+    --override_repository=llvm20_linux_x86_64=$HOME/llvm_stub \
+    --override_repository=llvm21_linux_x86_64=$HOME/llvm_stub \
+    --override_repository=llvm18_linux_aarch64=$HOME/llvm_stub \
+    --override_repository=llvm20_linux_aarch64=$HOME/llvm_stub \
+    --override_repository=llvm21_linux_aarch64=$HOME/llvm_stub \
+    --override_repository=llvm18_darwin_aarch64=$HOME/llvm_stub \
+    --override_repository=llvm20_darwin_aarch64=$HOME/llvm_stub \
+    --override_repository=local_config_cuda=$HOME/cuda_stub \
+    --override_repository=local_config_nccl=$HOME/nccl_stub \
+    --override_repository=local_config_tensorrt=$HOME/tensorrt_stub \
+    --override_repository=local_config_rocm=$HOME/rocm_stub \
+    --override_repository=cuda_cudart=$HOME/cuda_redist_stub \
+    --override_repository=cuda_profiler_api=$HOME/cuda_redist_stub \
+    --override_repository=cuda_nvcc=$HOME/cuda_redist_stub \
+    --override_repository=cuda_nvml=$HOME/cuda_redist_stub \
+    --override_repository=cuda_nvtx=$HOME/cuda_redist_stub \
+    --override_repository=cuda_cccl=$HOME/cuda_redist_stub \
+    --override_repository=cuda_cudnn=$HOME/cuda_redist_stub \
+    --override_repository=cuda_cudnn9=$HOME/cuda_redist_stub \
+    --override_repository=cuda_cublas=$HOME/cuda_redist_stub \
+    --override_repository=cuda_cusolver=$HOME/cuda_redist_stub \
+    --override_repository=cuda_cusparse=$HOME/cuda_redist_stub \
+    --override_repository=cuda_curand=$HOME/cuda_redist_stub \
+    --override_repository=cuda_cufft=$HOME/cuda_redist_stub \
+    --override_repository=cuda_cupti=$HOME/cuda_redist_stub \
+    --override_repository=cuda_nvdisasm=$HOME/cuda_redist_stub \
+    --override_repository=cuda_nvvm=$HOME/cuda_redist_stub \
+    --override_repository=cuda_nvjitlink=$HOME/cuda_redist_stub \
+    --override_repository=nvidia_wheel_versions=$HOME/cuda_redist_stub \
+    --override_repository=pypi=$HOME/pypi_stub \
+    --override_repository=pypi_absl_py=$HOME/pypi_stub \
+    --override_repository=pypi_astunparse=$HOME/pypi_stub \
+    --override_repository=pypi_auditwheel=$HOME/pypi_stub \
+    --override_repository=pypi_flatbuffers=$HOME/pypi_stub \
+    --override_repository=pypi_gast=$HOME/pypi_stub \
+    --override_repository=pypi_keras=$HOME/pypi_stub \
+    --override_repository=pypi_lit=$HOME/pypi_stub \
+    --override_repository=pypi_ml_dtypes=$HOME/pypi_stub \
+    --override_repository=pypi_mods=$HOME/pypi_stub \
+    --override_repository=pypi_numpy=$HOME/pypi_stub \
+    --override_repository=pypi_nvidia_cublas_cu12=$HOME/pypi_stub \
+    --override_repository=pypi_nvidia_cuda_cupti_cu12=$HOME/pypi_stub \
+    --override_repository=pypi_nvidia_cuda_nvcc_cu12=$HOME/pypi_stub \
+    --override_repository=pypi_nvidia_cuda_nvrtc_cu12=$HOME/pypi_stub \
+    --override_repository=pypi_nvidia_cuda_runtime_cu12=$HOME/pypi_stub \
+    --override_repository=pypi_nvidia_cudnn_cu12=$HOME/pypi_stub \
+    --override_repository=pypi_nvidia_cufft_cu12=$HOME/pypi_stub \
+    --override_repository=pypi_nvidia_curand_cu12=$HOME/pypi_stub \
+    --override_repository=pypi_nvidia_cusolver_cu12=$HOME/pypi_stub \
+    --override_repository=pypi_nvidia_cusparse_cu12=$HOME/pypi_stub \
+    --override_repository=pypi_nvidia_nccl_cu12=$HOME/pypi_stub \
+    --override_repository=pypi_nvidia_nvjitlink_cu12=$HOME/pypi_stub \
+    --override_repository=pypi_nvidia_nvshmem_cu12=$HOME/pypi_stub \
+    --override_repository=pypi_opt_einsum=$HOME/pypi_stub \
+    --override_repository=pypi_packaging=$HOME/pypi_stub \
+    --override_repository=pypi_protobuf=$HOME/pypi_stub \
+    --override_repository=pypi_requests=$HOME/pypi_stub \
+    --override_repository=pypi_setuptools=$HOME/pypi_stub \
+    --override_repository=pypi_termcolor=$HOME/pypi_stub \
+    --override_repository=pypi_typing_extensions=$HOME/pypi_stub \
+    --override_repository=pypi_wheel=$HOME/pypi_stub \
+    --override_repository=pypi_wrapt=$HOME/pypi_stub \
+    --override_repository=python_3_11_host=$HOME/python_stub \
+    --override_repository=local_config_python=$HOME/python_config_stub \
     --repo_env=HERMETIC_PYTHON_VERSION=3.11 \
     --repo_env=USE_HERMETIC_CC_TOOLCHAIN=0 \
     --noincompatible_enable_cc_toolchain_resolution \
@@ -1083,29 +1103,33 @@ bazel build \
     //tensorflow/tools/pip_package:wheel
 ```
 
-### Passo 12: Instalar o Pacote (Após a compilação terminar)
-> **Atenção:** Execute a partir de fora do diretório do código-fonte do TensorFlow!
+### Step 13: Report and Installation (After compilation finishes)
+If the previous compilation finishes without red failures, the final package (`.whl`) was successfully created! This step goes into the results folder, installs the last necessary C++ dependencies, and finally installs the native TensorFlow inside your Conda environment.
+> **Attention:** Run this from outside the TensorFlow source code directory!
 ```bash
 cd ~
-pip install --force-reinstall --no-deps \
-    /home/almalinux/tensorflow221/tensorflow/bazel-bin/tensorflow/tools/pip_package/wheel_house/tensorflow-2.21.0-cp311-cp311-linux_ppc64le.whl
-```
+WHEEL_FILE=$(ls $TF_BUILD_DIR/tensorflow/bazel-bin/tensorflow/tools/pip_package/*.whl 2>/dev/null | head -n 1)
 
-### Passo 13
-```bash
+echo "Installing additional dependencies via Conda..."
 conda install -c conda-forge h5py grpcio libclang ml_dtypes "protobuf>=6.31.1,<8.0.0" -y
+
+echo "Installing locally generated TensorFlow..."
+pip uninstall tensorflow -y || true
+pip install --force-reinstall --no-deps "$WHEEL_FILE"
 ```
 
-### Passo 14: Teste de Fogo
+### Step 14: Fire Test
+To ensure your compilation worked and is processing on the CPU, we run a short Python script. It creates two giant matrices (5000x5000) and multiplies them. If it prints the final data correctly, your installation was an absolute success!
+
 ```bash
 cd ~
 python3 -c "
 import tensorflow as tf
 import time
 
-print(f'\n--- Iniciando Teste de Fogo no Power9 (TF {tf.__version__}) ---')
+print(f'\n--- Starting Fire Test on Power9 (TF {tf.__version__}) ---')
 devices = tf.config.list_physical_devices()
-print('Dispositivos detectados:', [d.name for d in devices])
+print('Detected devices:', [d.name for d in devices])
 
 A = tf.random.normal([5000, 5000])
 B = tf.random.normal([5000, 5000])
@@ -1115,8 +1139,8 @@ C = tf.matmul(A, B)
 end = time.time()
 
 soma = tf.reduce_sum(C).numpy()
-print(f'Soma do resultado: {soma:.2f}')
-print(f'Tempo de execucao: {end - start:.4f} segundos')
-print('[VITORIA] TensorFlow nativo para Power9 esta 100% operacional!')
+print(f'Result sum: {soma:.2f}')
+print(f'Execution time: {end - start:.4f} seconds')
+print('[VICTORY] Native TensorFlow for Power9 is 100% operational!')
 "
 ```

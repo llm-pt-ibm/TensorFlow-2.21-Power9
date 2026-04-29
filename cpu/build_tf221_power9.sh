@@ -4,45 +4,48 @@ set -o pipefail
 
 # =============================================================================
 # Build TensorFlow 2.21 for Power9 (ppc64le) — AlmaLinux
-# Pré-requisito: Bazel 7.x já compilado e instalado em /usr/local/bin/bazel
-# Pré-requisito: Miniforge3 instalado em /root/miniforge3
+# Prerequisite: Bazel 7.x already compiled and installed in /usr/local/bin/bazel
+# Prerequisite: Miniforge3 installed in $HOME/miniforge3
 # =============================================================================
 
-TF_DIR="/home/almalinux/tensorflow221"
+export TF_BUILD_DIR="${TF_BUILD_DIR:-$PWD/tf221_workspace}"
+export CONDA_BASE="${CONDA_BASE:-$HOME/miniforge3}"
+
+TF_DIR="$TF_BUILD_DIR"
 CONDA_ENV="tf221_build"
-LLVM_STUB="/root/llvm_stub"
-ML_TOOLCHAIN="/root/rules_ml_toolchain_patched"
-PYTHON_WRAPPER="/root/python3_bazel.sh"
+LLVM_STUB="$HOME/llvm_stub"
+ML_TOOLCHAIN="$HOME/rules_ml_toolchain_patched"
+PYTHON_WRAPPER="$HOME/python3_bazel.sh"
 
-echo "=== Compilação do TensorFlow 2.21 para ppc64le (Power9) ==="
+echo "=== Compiling TensorFlow 2.21 for ppc64le (Power9) ==="
 
-# ---------- Passo 1: Dependências do SO ----------
-echo "=== 1/12: Instalando dependências do sistema ==="
+# ---------- Step 1: OS Dependencies ----------
+echo "=== 1/12: Installing system dependencies ==="
 sudo dnf install -y git gcc gcc-c++ zip unzip which patch wget vim-common
 
-# ---------- Passo 2: Ambiente Conda (SEM Bazel — já temos o nativo) ----------
-echo "=== 2/12: Criando ambiente Conda ==="
-source /root/miniforge3/etc/profile.d/conda.sh || source ~/miniforge3/etc/profile.d/conda.sh
+# ---------- Step 2: Conda Environment (NO Bazel — we already have native) ----------
+echo "=== 2/12: Creating Conda environment ==="
+source $CONDA_BASE/etc/profile.d/conda.sh
 conda create -n "$CONDA_ENV" "python=3.11" numpy wheel packaging requests -c conda-forge -y
 conda activate "$CONDA_ENV"
 
 echo "Python: $(python3 --version) em $(which python3)"
 echo "Bazel: $(bazel --version)"
 
-# ---------- Passo 3: Clonar TF 2.21 ----------
-echo "=== 3/12: Clonando TensorFlow 2.21 ==="
+# ---------- Step 3: Clone TF 2.21 ----------
+echo "=== 3/12: Cloning TensorFlow 2.21 ==="
 mkdir -p "$TF_DIR" && cd "$TF_DIR"
 rm -rf tensorflow
 git clone --depth 1 --branch v2.21.0 https://github.com/tensorflow/tensorflow.git
 cd tensorflow
 
-# ---------- Passo 4: Limpar configs ----------
-echo "=== 4/12: Limpando configs antigos ==="
+# ---------- Step 4: Clean configs ----------
+echo "=== 4/12: Cleaning old configs ==="
 rm -f .bazelversion
 bazel clean --expunge
 
-# ---------- Passo 5: Variáveis de ambiente ----------
-echo "=== 5/12: Configurando variáveis de ambiente ==="
+# ---------- Step 5: Environment variables ----------
+echo "=== 5/12: Configuring environment variables ==="
 export CC=gcc
 export CXX=g++
 export CFLAGS="-mno-float128 -O3"
@@ -92,7 +95,7 @@ cc_library(name = "cuda_wrappers_headers", hdrs = [], visibility = ["//visibilit
 EOF
 
 # --- CUDA stub (local_config_cuda) ---
-CUDA_STUB="/root/cuda_stub"
+CUDA_STUB="$HOME/cuda_stub"
 mkdir -p "$CUDA_STUB/cuda"
 touch "$CUDA_STUB/WORKSPACE"
 cat > "$CUDA_STUB/BUILD" << 'EOF'
@@ -184,7 +187,7 @@ EOF
 touch "$CUDA_STUB/cuda/cuda_config.h"
 
 # --- NCCL stub (local_config_nccl) ---
-NCCL_STUB="/root/nccl_stub"
+NCCL_STUB="$HOME/nccl_stub"
 mkdir -p "$NCCL_STUB/nccl"
 touch "$NCCL_STUB/WORKSPACE"
 cat > "$NCCL_STUB/BUILD" << 'EOF'
@@ -203,7 +206,7 @@ def if_nccl(if_true, if_false = []):
 EOF
 
 # --- CUDA redistribution stub (genérico para cuda_cudart, cuda_nvcc, etc.) ---
-CUDA_REDIST_STUB="/root/cuda_redist_stub"
+CUDA_REDIST_STUB="$HOME/cuda_redist_stub"
 mkdir -p "$CUDA_REDIST_STUB"
 touch "$CUDA_REDIST_STUB/WORKSPACE"
 echo 'VERSION = "0.0.0"' > "$CUDA_REDIST_STUB/version.bzl"
@@ -220,7 +223,7 @@ cc_library(name = "libs", srcs = [], visibility = ["//visibility:public"])
 EOF
 
 # --- TensorRT stub ---
-TENSORRT_STUB="/root/tensorrt_stub"
+TENSORRT_STUB="$HOME/tensorrt_stub"
 mkdir -p "$TENSORRT_STUB"
 touch "$TENSORRT_STUB/WORKSPACE"
 cat > "$TENSORRT_STUB/BUILD" << 'EOF'
@@ -242,7 +245,7 @@ def if_tensorrt_exec(if_true, if_false = []):
 EOF
 
 # --- ROCm stub ---
-ROCM_STUB="/root/rocm_stub"
+ROCM_STUB="$HOME/rocm_stub"
 mkdir -p "$ROCM_STUB/rocm"
 touch "$ROCM_STUB/WORKSPACE"
 cat > "$ROCM_STUB/BUILD" << 'EOF'
@@ -322,8 +325,8 @@ def rocm_library(**kwargs):
 EOF
 
 # --- PyPI stub (para dependências python) ---
-echo "⚙️  Configurando pypi_stub..."
-PYPI_STUB="/root/pypi_stub"
+echo "⚙️  Configuring pypi_stub..."
+PYPI_STUB="$HOME/pypi_stub"
 mkdir -p "$PYPI_STUB"
 touch "$PYPI_STUB/WORKSPACE"
 cat > "$PYPI_STUB/BUILD" << 'EOF'
@@ -362,11 +365,11 @@ py_library(name = "numpy", srcs = [])
 EOF
 
 # --- Python stub (python_3_11_host) ---
-echo "⚙️  Configurando python_stub..."
-PYTHON_STUB="/root/python_stub"
+echo "⚙️  Configuring python_stub..."
+PYTHON_STUB="$HOME/python_stub"
 mkdir -p "$PYTHON_STUB"
 touch "$PYTHON_STUB/WORKSPACE"
-ln -sf /root/miniforge3/envs/tf221_build/bin/python3 "$PYTHON_STUB/python3_bin"
+ln -sf $CONDA_BASE/envs/tf221_build/bin/python3 "$PYTHON_STUB/python3_bin"
 cat > "$PYTHON_STUB/BUILD" << 'EOF'
 package(default_visibility = ["//visibility:public"])
 exports_files(["python3_bin"])
@@ -377,8 +380,8 @@ cc_library(name = "python_headers", hdrs = [])
 EOF
 
 # --- Python config stub (local_config_python) ---
-echo "⚙️  Configurando python_config_stub..."
-PYTHON_CONFIG_STUB="/root/python_config_stub"
+echo "⚙️  Configuring python_config_stub..."
+PYTHON_CONFIG_STUB="$HOME/python_config_stub"
 mkdir -p "$PYTHON_CONFIG_STUB"
 touch "$PYTHON_CONFIG_STUB/WORKSPACE"
 PYINC=$(python3 -c "import sysconfig; print(sysconfig.get_path('include'))")
@@ -557,7 +560,7 @@ echo "=== 10/12: Patching Python hermético ==="
 cat > "$PYTHON_WRAPPER" << 'EOF'
 #!/bin/bash
 unset PYTHONHOME
-exec /root/miniforge3/envs/tf221_build/bin/python3 "$@"
+exec $CONDA_BASE/envs/tf221_build/bin/python3 "$@"
 EOF
 chmod +x "$PYTHON_WRAPPER"
 
@@ -587,8 +590,10 @@ with open(path, "w") as f:
 print("OK: python_init_toolchains patched")
 PYEOF
 
-# 10C — Redirecionar pip_parse para usar o wrapper Python
+# 10C — Redirect pip_parse para usar o wrapper Python
 python3 - << 'PYEOF'
+import os
+
 path = "third_party/xla/third_party/py/python_init_pip.bzl"
 with open(path, "r") as f:
     content = f.read()
@@ -597,7 +602,7 @@ content = content.replace(
     '''        python_interpreter_target = "@{}_host//:python".format(
             get_toolchain_name_per_python_version("python"),
         ),''',
-    '        python_interpreter = "/root/python3_bazel.sh",  # ppc64le: wrapper that unsets PYTHONHOME'
+    '        python_interpreter = "' + os.environ.get("HOME", "/root") + '/python3_bazel.sh",  # ppc64le: wrapper that unsets PYTHONHOME'
 )
 
 with open(path, "w") as f:
@@ -1051,7 +1056,7 @@ bazel build \
     --jobs=$(nproc) \
     //tensorflow/tools/pip_package:wheel
 
-# ---------- Passo 13: Relatório e Instalação ----------
+# ---------- Step 13: Report and Installation ----------
 WHEEL_FILE=$(ls bazel-bin/tensorflow/tools/pip_package/*.whl 2>/dev/null | head -n 1)
 
 if [ -f "$WHEEL_FILE" ]; then
@@ -1065,6 +1070,30 @@ if [ -f "$WHEEL_FILE" ]; then
     pip install --force-reinstall --no-deps "$TF_DIR/tensorflow/$WHEEL_FILE"
     echo "=== INSTALAÇÃO CONCLUÍDA. TensorFlow pronto para uso no ambiente $CONDA_ENV! ==="
 else
-    echo "=== ERRO: pacote .whl não encontrado ==="
+    echo "=== ERROR: .whl package not found ==="
     exit 1
 fi
+
+# ---------- Step 14: Fire Test ----------
+echo "=== 14/14: Running Fire Test ==="
+cd ~
+python3 -c "
+import tensorflow as tf
+import time
+
+print(f'\n--- Starting Fire Test on Power9 (TF {tf.__version__}) ---')
+devices = tf.config.list_physical_devices()
+print('Detected devices:', [d.name for d in devices])
+
+A = tf.random.normal([5000, 5000])
+B = tf.random.normal([5000, 5000])
+
+start = time.time()
+C = tf.matmul(A, B)
+end = time.time()
+
+soma = tf.reduce_sum(C).numpy()
+print(f'Result sum: {soma:.2f}')
+print(f'Execution time: {end - start:.4f} seconds')
+print('[VICTORY] Native TensorFlow for Power9 is 100% operational!')
+"
