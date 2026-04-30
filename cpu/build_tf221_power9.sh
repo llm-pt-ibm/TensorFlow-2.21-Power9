@@ -15,7 +15,7 @@ TF_DIR="$TF_BUILD_DIR"
 CONDA_ENV="tf221_build"
 LLVM_STUB="$HOME/llvm_stub"
 ML_TOOLCHAIN="$HOME/rules_ml_toolchain_patched"
-PYTHON_WRAPPER="$HOME/python3_bazel.sh"
+PYTHON_WRAPPER="/tmp/tf_python3_wrapper.sh"
 
 echo "=== Compiling TensorFlow 2.21 for ppc64le (Power9) ==="
 
@@ -26,7 +26,7 @@ sudo dnf install -y git gcc gcc-c++ zip unzip which patch wget vim-common
 # ---------- Step 2: Conda Environment (NO Bazel — we already have native) ----------
 echo "=== 2/12: Creating Conda environment ==="
 source $CONDA_BASE/etc/profile.d/conda.sh
-conda create -n "$CONDA_ENV" "python=3.11" numpy wheel packaging requests -c conda-forge -y
+conda create -n "$CONDA_ENV" "python=3.11" "numpy>=2.0.0" wheel packaging requests -c conda-forge -y
 conda activate "$CONDA_ENV"
 
 echo "Python: $(python3 --version) em $(which python3)"
@@ -42,7 +42,7 @@ cd tensorflow
 # ---------- Step 4: Clean configs ----------
 echo "=== 4/12: Cleaning old configs ==="
 rm -f .bazelversion
-bazel clean --expunge
+#bazel clean --expunge
 
 # ---------- Step 5: Environment variables ----------
 echo "=== 5/12: Configuring environment variables ==="
@@ -353,7 +353,8 @@ done
 
 # Numpy precisa de headers C
 NUMPY_INC=$(python3 -c "import numpy; print(numpy.get_include())")
-ln -sf "$NUMPY_INC" "$PYPI_STUB/numpy/numpy_include"
+rm -f "$PYPI_STUB/numpy/numpy_include"
+ln -snf "$NUMPY_INC" "$PYPI_STUB/numpy/numpy_include"
 cat > "$PYPI_STUB/numpy/BUILD" << 'EOF'
 package(default_visibility = ["//visibility:public"])
 cc_library(
@@ -385,7 +386,8 @@ PYTHON_CONFIG_STUB="$HOME/python_config_stub"
 mkdir -p "$PYTHON_CONFIG_STUB"
 touch "$PYTHON_CONFIG_STUB/WORKSPACE"
 PYINC=$(python3 -c "import sysconfig; print(sysconfig.get_path('include'))")
-ln -sf "$PYINC" "$PYTHON_CONFIG_STUB/python_include"
+rm -f "$PYTHON_CONFIG_STUB/python_include"
+ln -snf "$PYINC" "$PYTHON_CONFIG_STUB/python_include"
 
 cat > "$PYTHON_CONFIG_STUB/py_cc_toolchain.bzl" << 'EOF'
 def _py_cc_toolchain_impl(ctx):
@@ -602,7 +604,7 @@ content = content.replace(
     '''        python_interpreter_target = "@{}_host//:python".format(
             get_toolchain_name_per_python_version("python"),
         ),''',
-    '        python_interpreter = "' + os.environ.get("HOME", "/root") + '/python3_bazel.sh",  # ppc64le: wrapper that unsets PYTHONHOME'
+    '        python_interpreter = "/tmp/tf_python3_wrapper.sh",  # ppc64le: wrapper that unsets PYTHONHOME'
 )
 
 with open(path, "w") as f:
@@ -656,7 +658,7 @@ sed -i 's/) noexcept = default;/) = default;/g' third_party/xla/xla/shape.cc
 
 # 10J — Patch XLA dso_loader.cc (Remover Headers CUDA/TensorRT ausentes)
 echo "Patching XLA dso_loader.cc cuda_config.h..."
-sed -i 's|#include "third_party/gpus/cuda/cuda_config.h"|#define TF_CUDA_VERSION "0"\\n#define TF_CUDNN_VERSION "0"\\n#define TF_CUDART_VERSION "0"\\n#define TF_CUPTI_VERSION "0"\\n#define TF_CUBLAS_VERSION "0"\\n#define TF_CUSOLVER_VERSION "0"\\n#define TF_CUFFT_VERSION "0"\\n#define TF_CUSPARSE_VERSION "0"|g' third_party/xla/xla/tsl/platform/default/dso_loader.cc
+sed -i 's|#include "third_party/gpus/cuda/cuda_config.h"|#define TF_CUDA_VERSION "0"\n#define TF_CUDNN_VERSION "0"\n#define TF_CUDART_VERSION "0"\n#define TF_CUPTI_VERSION "0"\n#define TF_CUBLAS_VERSION "0"\n#define TF_CUSOLVER_VERSION "0"\n#define TF_CUFFT_VERSION "0"\n#define TF_CUSPARSE_VERSION "0"|g' third_party/xla/xla/tsl/platform/default/dso_loader.cc
 sed -i 's|#include "third_party/tensorrt/tensorrt_config.h"|#define TF_TENSORRT_VERSION "0"|g' third_party/xla/xla/tsl/platform/default/dso_loader.cc
 sed -i 's|#include "third_party/gpus/rocm/rocm_config.h"|#define TF_ROCM_VERSION "0"|g' third_party/xla/xla/tsl/platform/default/dso_loader.cc
 sed -i 's|#include "third_party/nccl/nccl_config.h"|#define TF_NCCL_VERSION "0"|g' third_party/xla/xla/tsl/platform/default/dso_loader.cc
@@ -674,7 +676,18 @@ with open(p, 'w') as f:
     f.write(t)
 PYEOF
 
-# 10L — Patch MLIR fuse_qdq_pass.cc (Bug GCC 13 NoDestructor Ambiguity)
+# 10L — Patch XLA ffi attribute_map.cc (Bug GCC 8 static_assert template dep)
+echo "Patching XLA ffi attribute_map.cc static_assert(false) -> static_assert(sizeof(U)==0)..."
+python3 - << 'PYEOF'
+p = 'third_party/xla/xla/ffi/attribute_map.cc'
+with open(p, 'r') as f:
+    t = f.read()
+t = t.replace('static_assert(false', 'static_assert(sizeof(U) == 0')
+with open(p, 'w') as f:
+    f.write(t)
+PYEOF
+
+# 10M — Patch MLIR fuse_qdq_pass.cc (Bug GCC 13 NoDestructor Ambiguity)
 echo "Patching MLIR fuse_qdq_pass.cc NoDestructor..."
 python3 - << 'PYEOF'
 import re
@@ -811,18 +824,53 @@ import re
 p = 'third_party/xla/xla/backends/cpu/runtime/thunk_executor.cc'
 with open(p, 'r') as f:
     t = f.read()
-# Substitui o ThunkOperation problemático que usa vector de std::unique_ptr
-# Como reserve tenta copiar, vamos apenas tirar o reserve ou reescrever a inicialização.
+
+# Remove a tentativa falha anterior
 t = re.sub(
-    r'std::vector<ThunkOperation> thunk_operations;[^{}]*thunk_operations\.reserve\(node\.thunks\(\)\.size\(\)\);',
-    r'std::vector<ThunkOperation> thunk_operations;',
-    t, count=1
+    r'class ThunkOperation : public ExecutionGraph::Operation \{\n public:\n  ThunkOperation\(ThunkOperation&&\) noexcept = default;\n  ThunkOperation& operator=\(ThunkOperation&&\) noexcept = default;',
+    r'class ThunkOperation : public ExecutionGraph::Operation {', t
 )
+
+# Adiciona move constructors explícitos com campos move
+code = '''class ThunkOperation : public ExecutionGraph::Operation {
+ public:
+  ThunkOperation(ThunkOperation&& other) noexcept
+      : ExecutionGraph::Operation(std::move(other)),
+        name_(std::move(other.name_)),
+        op_type_id_(other.op_type_id_),
+        buffer_uses_(std::move(other.buffer_uses_)),
+        resource_uses_(std::move(other.resource_uses_)) {}
+  ThunkOperation& operator=(ThunkOperation&& other) noexcept {
+    ExecutionGraph::Operation::operator=(std::move(other));
+    name_ = std::move(other.name_);
+    op_type_id_ = other.op_type_id_;
+    buffer_uses_ = std::move(other.buffer_uses_);
+    resource_uses_ = std::move(other.resource_uses_);
+    return *this;
+  }'''
+
+t = t.replace('class ThunkOperation : public ExecutionGraph::Operation {', code)
+
 with open(p, 'w') as f:
     f.write(t)
 PYEOF
 
-# 10U — Patch build_pip_package.py para proteger glob.glob[0] e copytree
+# 10U — Patch XLA expand_integer_power.cc (Bug GCC 8 Ambiguity curly braces)
+echo "Patching expand_integer_power.cc to avoid brace initialization ambiguity..."
+python3 - << 'PYEOF'
+import re
+p = 'third_party/xla/xla/codegen/emitters/transforms/expand_integer_power.cc'
+with open(p, 'r') as f:
+    t = f.read()
+
+# Replace `{op->getOperands()}` with `op->getOperands()`
+t = t.replace('{op->getOperands()}', 'op->getOperands()')
+
+with open(p, 'w') as f:
+    f.write(t)
+PYEOF
+
+# 10V — Patch build_pip_package.py para proteger glob.glob[0] e copytree
 python3 - << 'PYEOF'
 import re
 
@@ -944,26 +992,36 @@ if os.path.exists(pybind_bzl):
 else:
     print(f"AVISO: {pybind_bzl} nao encontrado ainda (sera patchado apos primeiro fetch)")
 
-# 2. Patch de seguranca: pragma nos arquivos proto_cast_util
-proto_dir = f"{base}/external/pybind11_protobuf/pybind11_protobuf"
-for fname in ['proto_cast_util.h', 'proto_cast_util.cc']:
-    path = f"{proto_dir}/{fname}"
-    if not os.path.exists(path):
-        continue
-    os.chmod(path, 0o644)
-    with open(path, 'r') as f:
-        content = f.read()
-    content = content.replace('__attribute__((visibility("default"))) ', '')
-    if '#pragma GCC visibility push(default)' not in content:
-        content = re.sub(
-            r'((?:#include [^\n]+\n)+)(?!#include)',
-            lambda m: m.group(0) + '\n#pragma GCC visibility push(default)\n',
-            content, count=1
-        )
-        content = content.rstrip() + '\n\n#pragma GCC visibility pop\n'
-    with open(path, 'w') as f:
-        f.write(content)
-    print(f"OK: {fname} patchado")
+# 2. Patch de visibilidade irrestrita para TODOS os pacotes auxiliares pybind11 (abseil, protobuf, status)
+import glob
+
+def enforce_visibility(search_path_pattern):
+    for path in glob.glob(search_path_pattern, recursive=True):
+        if not os.path.isfile(path): continue
+        if path.endswith(".h") or path.endswith(".cc"):
+            os.chmod(path, 0o644)
+            with open(path, 'r') as f:
+                content = f.read()
+            content = content.replace('__attribute__((visibility("default"))) ', '')
+            if '#pragma GCC visibility push(default)' not in content:
+                # Inserir no início (após os includes)
+                content = re.sub(
+                    r'((?:#include [^\n]+\n)+)(?!#include)',
+                    lambda m: m.group(0) + '\n#pragma GCC visibility push(default)\n',
+                    content, count=1
+                )
+                if '#pragma GCC visibility push(default)' not in content:
+                    content = '#pragma GCC visibility push(default)\n\n' + content
+                content = content.rstrip() + '\n\n#pragma GCC visibility pop\n'
+                with open(path, 'w') as f:
+                    f.write(content)
+                print(f"Visibilidade forçada em: {path}")
+
+# Garantir visibilidade irrestrita p/ status e utils
+enforce_visibility(f"{base}/external/pybind11_protobuf/pybind11_protobuf/**/*.h")
+enforce_visibility(f"{base}/external/pybind11_protobuf/pybind11_protobuf/**/*.cc")
+enforce_visibility(f"{base}/external/pybind11_abseil/**/*.h")
+enforce_visibility(f"{base}/external/pybind11_abseil/**/*.cc")
 
 print("=== Todos os patches de visibilidade aplicados! ===")
 PYEOF
@@ -1057,17 +1115,18 @@ bazel build \
     //tensorflow/tools/pip_package:wheel
 
 # ---------- Step 13: Report and Installation ----------
-WHEEL_FILE=$(ls bazel-bin/tensorflow/tools/pip_package/*.whl 2>/dev/null | head -n 1)
+WHEEL_FILE=$(ls bazel-bin/tensorflow/tools/pip_package/wheel_house/*.whl bazel-bin/tensorflow/tools/pip_package/*.whl 2>/dev/null | head -n 1)
 
 if [ -f "$WHEEL_FILE" ]; then
     echo "=== COMPILAÇÃO CONCLUÍDA COM SUCESSO! ==="
     echo "Pacote gerado: $WHEEL_FILE"
     echo "Instalando dependências adicionais via Conda (sem numpy — já instalado pelo conda)..."
-    conda install -c conda-forge h5py grpcio libclang ml_dtypes "protobuf>=6.31.1,<8.0.0" -y
+    conda install -c conda-forge "h5py<3.15.0" grpcio libclang ml_dtypes "protobuf>=6.31.1,<8.0.0" absl-py astunparse flatbuffers gast google-pasta opt_einsum termcolor wrapt libstdcxx-ng pillow tensorboard -y
     echo "Instalando o TensorFlow gerado localmente (--no-deps evita compilar numpy do zero)..."
     pip uninstall tensorflow -y || true
     cd ~
     pip install --force-reinstall --no-deps "$TF_DIR/tensorflow/$WHEEL_FILE"
+    pip install "keras>=3.0.0" flatbuffers || true
     echo "=== INSTALAÇÃO CONCLUÍDA. TensorFlow pronto para uso no ambiente $CONDA_ENV! ==="
 else
     echo "=== ERROR: .whl package not found ==="
@@ -1077,6 +1136,7 @@ fi
 # ---------- Step 14: Fire Test ----------
 echo "=== 14/14: Running Fire Test ==="
 cd ~
+export LD_LIBRARY_PATH=$CONDA_BASE/envs/$CONDA_ENV/lib:$LD_LIBRARY_PATH
 python3 -c "
 import tensorflow as tf
 import time
