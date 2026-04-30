@@ -24,7 +24,7 @@ Since you compiled Bazel manually in `/usr/local/bin`, we will NOT install Bazel
 
 ```bash
 source $CONDA_BASE/etc/profile.d/conda.sh
-conda create -n tf221_build "python=3.11" numpy wheel packaging requests -c conda-forge -y
+conda create -n tf221_build "python=3.11" "numpy>=2.0.0" wheel packaging requests -c conda-forge -y
 conda activate tf221_build
 ```
 
@@ -43,7 +43,7 @@ To ensure there are no remnants of old or unsuccessful builds, we clean the Baze
 
 ```bash
 rm -f .bazelversion
-bazel clean --expunge
+# bazel clean --expunge
 ```
 
 ### Step 5: Configure environment variables (The Secret Sauce)
@@ -73,7 +73,7 @@ echo -e "\n\n\n\n\n\n\n\n\n\n" | ./configure
 ```
 
 ### Step 7: Fix the "local.bzl" bug in rules_ml_toolchain
-O Bazel 7.1.0 removeu o arquivo `local.bzl`. Vamos baixar o pacote problemático, consertá-lo e depois usá-lo localmente:
+O Bazel 7.1.0 removeu o arquivo `local.bzl`. Vamos baixar o pacote problemático, consertá-lo e depois usá-lo localmente em `$HOME/rules_ml_toolchain_patched`:
 
 ```bash
 cd ~
@@ -576,12 +576,12 @@ python3 /tmp/patch_workspace3.py
 
 **10A — Create Python wrapper** (fixes the wrong PYTHONHOME bug):
 ```bash
-cat > $HOME/python3_bazel.sh << 'EOF'
+cat > /tmp/tf_python3_wrapper.sh << 'EOF'
 #!/bin/bash
 unset PYTHONHOME
 exec $CONDA_BASE/envs/tf221_build/bin/python3 "$@"
 EOF
-chmod +x $HOME/python3_bazel.sh
+chmod +x /tmp/tf_python3_wrapper.sh
 ```
 
 **10B — Disable hermetic Python download:**
@@ -624,7 +624,7 @@ content = content.replace(
     '''        python_interpreter_target = "@{}_host//:python".format(
             get_toolchain_name_per_python_version("python"),
         ),''',
-    '        python_interpreter = "$HOME/python3_bazel.sh",  # ppc64le: wrapper that unsets PYTHONHOME'
+    '        python_interpreter = "/tmp/tf_python3_wrapper.sh",  # ppc64le: wrapper that unsets PYTHONHOME'
 )
 
 with open(path, "w") as f:
@@ -804,7 +804,7 @@ for p in glob.glob('third_party/xla/xla/codegen/*.h') + glob.glob('third_party/x
         f.write(t)
 PYEOF
 ```
-**10R**
+**10R — Patch XLA ynn_support.cc** (Bug GCC 8 Ambiguous NoDestructor initializer list):
 
 ```bash
 python3 - << 'PYEOF'
@@ -817,7 +817,7 @@ with open(p, 'w') as f:
     f.write(t)
 PYEOF
 ```
-**10S**
+**10S — Patch XLA convolution_lib.h** (Bug GCC 8 const lambda capture CountDown):
 
 ```bash
 python3 - << 'PYEOF'
@@ -834,7 +834,7 @@ with open(p, 'w') as f:
     f.write(t)
 PYEOF
 ```
-**10T**
+**10T — Patch XLA thunk_executor.cc** (Bug GCC 8 std::unique_ptr copy vector reserve):
 
 ```bash
 python3 - << 'PYEOF'
@@ -842,17 +842,49 @@ import re
 p = 'third_party/xla/xla/backends/cpu/runtime/thunk_executor.cc'
 with open(p, 'r') as f:
     t = f.read()
-t = re.sub(
-    r'std::vector<ThunkOperation> thunk_operations;[^{}]*thunk_operations\.reserve\(node\.thunks\(\)\.size\(\)\);',
-    r'std::vector<ThunkOperation> thunk_operations;',
-    t, count=1
-)
+
+# Adiciona move constructors explícitos com campos move
+code = '''class ThunkOperation : public ExecutionGraph::Operation {
+ public:
+  ThunkOperation(ThunkOperation&& other) noexcept
+      : ExecutionGraph::Operation(std::move(other)),
+        name_(std::move(other.name_)),
+        op_type_id_(other.op_type_id_),
+        buffer_uses_(std::move(other.buffer_uses_)),
+        resource_uses_(std::move(other.resource_uses_)) {}
+  ThunkOperation& operator=(ThunkOperation&& other) noexcept {
+    ExecutionGraph::Operation::operator=(std::move(other));
+    name_ = std::move(other.name_);
+    op_type_id_ = other.op_type_id_;
+    buffer_uses_ = std::move(other.buffer_uses_);
+    resource_uses_ = std::move(other.resource_uses_);
+    return *this;
+  }'''
+
+t = t.replace('class ThunkOperation : public ExecutionGraph::Operation {', code)
+
 with open(p, 'w') as f:
     f.write(t)
 PYEOF
 ```
-**10U**
 
+**10U — Patch XLA expand_integer_power.cc** (Bug GCC 8 Ambiguity curly braces):
+```bash
+python3 - << 'PYEOF'
+import re
+p = 'third_party/xla/xla/codegen/emitters/transforms/expand_integer_power.cc'
+with open(p, 'r') as f:
+    t = f.read()
+
+# Replace `{op->getOperands()}` with `op->getOperands()`
+t = t.replace('{op->getOperands()}', 'op->getOperands()')
+
+with open(p, 'w') as f:
+    f.write(t)
+PYEOF
+```
+
+**10V — Patch build_pip_package.py para proteger glob.glob[0] e copytree**
 ```bash
 python3 - << 'PYEOF'
 import re
@@ -972,9 +1004,8 @@ if os.path.exists(pybind_bzl):
     with open(pybind_bzl, 'r') as f:
         content = f.read()
     # AVISO: Starlark NAO aceita comentarios # dentro de listas.
-    # Substituir a flag pelo vazio e limpar os arrays resultantes com regex.
     content = content.replace('"" # -fvisibility=hidden disabled for ppc64le', '')  # limpar patch anterior
-    content = content.replace("'' # -fvisibility=hidden disabled for ppc64le", '')  # limpar patch anterior
+    content = content.replace("'' # -fvisibility=hidden disabled for ppc64le", '')
     content = content.replace('"-fvisibility=hidden"', '""')
     content = content.replace("'-fvisibility=hidden'", "''")
     import re
@@ -984,28 +1015,38 @@ if os.path.exists(pybind_bzl):
         f.write(content)
     print(f"OK: pybind11_bazel/build_defs.bzl patchado")
 else:
-    print(f"AVISO: {pybind_bzl} nao encontrado. Execute um 'bazel build' primeiro para popular o cache.")
+    print(f"AVISO: {pybind_bzl} nao encontrado ainda (sera patchado apos primeiro fetch)")
 
-# 2. Patch redundante de seguranca: pragma nos arquivos proto_cast_util
-proto_dir = f"{base}/external/pybind11_protobuf/pybind11_protobuf"
-for fname in ['proto_cast_util.h', 'proto_cast_util.cc']:
-    path = f"{proto_dir}/{fname}"
-    if not os.path.exists(path):
-        continue
-    os.chmod(path, 0o644)
-    with open(path, 'r') as f:
-        content = f.read()
-    content = content.replace('__attribute__((visibility("default"))) ', '')
-    if '#pragma GCC visibility push(default)' not in content:
-        content = re.sub(
-            r'((?:#include [^\n]+\n)+)(?!#include)',
-            lambda m: m.group(0) + '\n#pragma GCC visibility push(default)\n',
-            content, count=1
-        )
-        content = content.rstrip() + '\n\n#pragma GCC visibility pop\n'
-    with open(path, 'w') as f:
-        f.write(content)
-    print(f"OK: {fname} patchado")
+# 2. Patch de visibilidade irrestrita para TODOS os pacotes auxiliares pybind11 (abseil, protobuf, status)
+import glob
+
+def enforce_visibility(search_path_pattern):
+    for path in glob.glob(search_path_pattern, recursive=True):
+        if not os.path.isfile(path): continue
+        if path.endswith(".h") or path.endswith(".cc"):
+            os.chmod(path, 0o644)
+            with open(path, 'r') as f:
+                content = f.read()
+            content = content.replace('__attribute__((visibility("default"))) ', '')
+            if '#pragma GCC visibility push(default)' not in content:
+                # Inserir no início (após os includes)
+                content = re.sub(
+                    r'((?:#include [^\n]+\n)+)(?!#include)',
+                    lambda m: m.group(0) + '\n#pragma GCC visibility push(default)\n',
+                    content, count=1
+                )
+                if '#pragma GCC visibility push(default)' not in content:
+                    content = '#pragma GCC visibility push(default)\n\n' + content
+                content = content.rstrip() + '\n\n#pragma GCC visibility pop\n'
+                with open(path, 'w') as f:
+                    f.write(content)
+                print(f"Visibilidade forçada em: {path}")
+
+# Garantir visibilidade irrestrita p/ status e utils
+enforce_visibility(f"{base}/external/pybind11_protobuf/pybind11_protobuf/**/*.h")
+enforce_visibility(f"{base}/external/pybind11_protobuf/pybind11_protobuf/**/*.cc")
+enforce_visibility(f"{base}/external/pybind11_abseil/**/*.h")
+enforce_visibility(f"{base}/external/pybind11_abseil/**/*.cc")
 
 print("=== Todos os patches de visibilidade aplicados! ===")
 PYEOF
@@ -1019,12 +1060,12 @@ The moment of truth has arrived. This giant command calls Bazel and instructs it
 ```bash
 bazel build \
     --config=opt \
-    --define=tflite_with_xnnpack=false \
-    --local_ram_resources=HOST_RAM*.6 \
-    --per_file_copt=".*@-Wno-error" \
     --copt=-fvisibility=default \
     --cxxopt=-fvisibility=default \
     --copt=-DPYBIND11_EXPORT="__attribute__((visibility(\"default\")))" \
+    --define=tflite_with_xnnpack=false \
+    --local_ram_resources=HOST_RAM*.6 \
+    --per_file_copt=".*@-Wno-error" \
     --extra_toolchains=@@local_config_python//:py_cc_toolchain \
     --override_repository=rules_ml_toolchain=$HOME/rules_ml_toolchain_patched \
     --override_repository=llvm_linux_x86_64=$HOME/llvm_stub \
@@ -1105,17 +1146,24 @@ bazel build \
 
 ### Step 13: Report and Installation (After compilation finishes)
 If the previous compilation finishes without red failures, the final package (`.whl`) was successfully created! This step goes into the results folder, installs the last necessary C++ dependencies, and finally installs the native TensorFlow inside your Conda environment.
+
 > **Attention:** Run this from outside the TensorFlow source code directory!
+
 ```bash
 cd ~
-WHEEL_FILE=$(ls $TF_BUILD_DIR/tensorflow/bazel-bin/tensorflow/tools/pip_package/*.whl 2>/dev/null | head -n 1)
+WHEEL_FILE=$(ls $TF_BUILD_DIR/tensorflow/bazel-bin/tensorflow/tools/pip_package/wheel_house/*.whl $TF_BUILD_DIR/tensorflow/bazel-bin/tensorflow/tools/pip_package/*.whl 2>/dev/null | head -n 1)
 
-echo "Installing additional dependencies via Conda..."
-conda install -c conda-forge h5py grpcio libclang ml_dtypes "protobuf>=6.31.1,<8.0.0" -y
+if [ -f "$WHEEL_FILE" ]; then
+    echo "Installing additional dependencies via Conda (without numpy - already installed)..."
+    conda install -c conda-forge "h5py<3.15.0" grpcio libclang ml_dtypes "protobuf>=6.31.1,<8.0.0" absl-py astunparse flatbuffers gast google-pasta opt_einsum termcolor wrapt libstdcxx-ng pillow tensorboard -y
 
-echo "Installing locally generated TensorFlow..."
-pip uninstall tensorflow -y || true
-pip install --force-reinstall --no-deps "$WHEEL_FILE"
+    echo "Installing locally generated TensorFlow..."
+    pip uninstall tensorflow -y || true
+    pip install --force-reinstall --no-deps "$WHEEL_FILE"
+    pip install "keras>=3.0.0" flatbuffers || true
+else
+    echo "ERROR: .whl package not found"
+fi
 ```
 
 ### Step 14: Fire Test
@@ -1123,6 +1171,7 @@ To ensure your compilation worked and is processing on the CPU, we run a short P
 
 ```bash
 cd ~
+export LD_LIBRARY_PATH=$CONDA_BASE/envs/tf221_build/lib:$LD_LIBRARY_PATH
 python3 -c "
 import tensorflow as tf
 import time
