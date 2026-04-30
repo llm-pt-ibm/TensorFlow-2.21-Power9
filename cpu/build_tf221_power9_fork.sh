@@ -42,7 +42,7 @@ echo "Bazel: $(bazel --version)"
 echo "=== 3/12: Cloning TensorFlow 2.21 ==="
 mkdir -p "$TF_DIR" && cd "$TF_DIR"
 rm -rf tensorflow
-git clone --branch power9-v2.21.0 git@github.com:llm-pt-ibm/tensorflow.git
+git clone --branch power9-v2.21.0-cpu-only https://github.com/llm-pt-ibm/tensorflow.git
 cd tensorflow
 
 # ---------- Step 4: Clean configs ----------
