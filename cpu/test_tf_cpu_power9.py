@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Suíte de Testes Completa — TensorFlow 2.21 CPU-Only no Power9 (ppc64le)
-Cobre todas as funcionalidades principais disponíveis em modo CPU.
+Suite de Testes Completa - TensorFlow 2.21 CPU-Only no Power9 (ppc64le)
+Cobre todas as funcionalidades principais disponiveis em modo CPU.
 """
 import sys
 import time
@@ -14,6 +15,11 @@ import numpy as np
 
 PASSED = []
 FAILED = []
+
+
+def assert_(cond):
+    if not cond:
+        raise AssertionError("Assertion failed")
 
 def test(name, fn):
     """Executa e registra um teste imediatamente."""
@@ -30,7 +36,7 @@ def test(name, fn):
 
 # ===========================================================================
 print(f"\n{'='*60}")
-print(f"  TensorFlow {tf.__version__} — Teste CPU-Only Power9")
+print(f"  TensorFlow {tf.__version__} - Teste CPU-Only Power9")
 print(f"  Python {sys.version.split()[0]}")
 print(f"  Dispositivos: {[d.name for d in tf.config.list_physical_devices()]}")
 print(f"{'='*60}\n")
@@ -135,7 +141,7 @@ test("Gradiente de cross-entropy loss", t_grad4)
 # ===========================================================================
 # 3. KERAS
 # ===========================================================================
-print("\n[ 3 ] Keras — Construção e Treinamento")
+print("\n[ 3 ] Keras - Construção e Treinamento")
 
 def t_keras_seq():
     model = tf.keras.Sequential([
@@ -388,9 +394,6 @@ test("Ragged Tensors", t_ragged)
 # ===========================================================================
 # RELATÓRIO FINAL
 # ===========================================================================
-def assert_(cond):
-    if not cond: raise AssertionError("Assertion failed")
-
 total = len(PASSED) + len(FAILED)
 print(f"\n{'='*60}")
 print(f"  RESULTADO FINAL: {len(PASSED)}/{total} testes passaram")

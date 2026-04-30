@@ -16,7 +16,7 @@ TF_DIR="$TF_BUILD_DIR"
 CONDA_ENV="tf221_build"
 LLVM_STUB="$HOME/llvm_stub"
 ML_TOOLCHAIN="$HOME/rules_ml_toolchain_patched"
-PYTHON_WRAPPER="$HOME/python3_bazel.sh"
+PYTHON_WRAPPER="/tmp/tf_python3_wrapper.sh"
 
 echo "=== Compiling TensorFlow 2.21 for ppc64le (Power9) ==="
 
