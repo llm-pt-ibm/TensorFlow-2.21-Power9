@@ -569,6 +569,9 @@ with open(path, "w") as f:
 PYEOF
 
 # 10V — Patch build_pip_package.py (Build-system fix)
+# First, restore the file to its pristine state to avoid double-patching from previous runs
+git checkout -- tensorflow/tools/pip_package/build_pip_package.py 2>/dev/null || true
+
 python3 - << 'PYEOF'
 import re
 path = "tensorflow/tools/pip_package/build_pip_package.py"
@@ -585,6 +588,9 @@ import shutil
 import os
 import subprocess
 import re
+
+# Sentinel: prevent double-patching on re-runs
+_PPC64LE_PATCHED = True
 
 _orig_copytree = shutil.copytree
 def _robust_copytree(src, dst, *args, **kwargs):
@@ -616,30 +622,18 @@ def _patched_run(args, **kwargs):
 
 subprocess.run = _patched_run
 """
-if code.startswith("#!"):
-    parts = code.split("\n", 1)
-    code = parts[0] + "\n" + injection + parts[1]
-else:
-    code = injection + "\n" + code
+# Only inject if not already patched (prevents recursion on re-runs)
+if "_PPC64LE_PATCHED" not in code:
+    if code.startswith("#!"):
+        parts = code.split("\n", 1)
+        code = parts[0] + "\n" + injection + parts[1]
+    else:
+        code = injection + "\n" + code
 with open(path, "w") as f:
     f.write(code)
 PYEOF
 
-# ---------- Passo 11: Patch do tensorflow.bzl (Bazel 7 transition fix) ----------
-echo "=== 11/13: Patching tensorflow.bzl ==="
-python3 - << 'PYEOF'
-import re
-filepath = "tensorflow/tensorflow.bzl"
-with open(filepath, "r") as f:
-    data = f.read()
-data = re.sub(r'inputs\s*=\s*\[\s*"//command_line_option:modify_execution_info",?\s*\]', 'inputs = []', data)
-data = re.sub(r'outputs\s*=\s*\[\s*"//command_line_option:modify_execution_info",?\s*\]', 'outputs = []', data)
-old_func_pattern = r'def _local_exec_transition_impl\(settings, attr\):.*?return \{.*?\}'
-new_func_stub = 'def _local_exec_transition_impl(settings, attr):\n    return {}'
-data = re.sub(old_func_pattern, new_func_stub, data, flags=re.DOTALL)
-with open(filepath, "w") as f:
-    f.write(data)
-PYEOF
+
 
 # ---------- Passo 11.1: Patch pybind11_bazel ----------
 echo "=== 11.1/13: Removendo -fvisibility=hidden do pybind_library macro ==="
@@ -685,7 +679,23 @@ enforce_visibility(f"{base}/external/pybind11_abseil/**/*.h")
 enforce_visibility(f"{base}/external/pybind11_abseil/**/*.cc")
 PYEOF
 
-# (gen_git_source.py branch check is handled by re-running ./configure after git pull)
+# 10W — Patch gen_git_source.py (Branch check bypass)
+echo "Patching gen_git_source.py..."
+python3 - << 'PYEOF'
+import re
+p = 'tensorflow/tools/git/gen_git_source.py'
+with open(p, 'r') as f:
+    t = f.read()
+
+# Forçar branch_ref a ser sempre válido ou vazio mas existente
+t = t.replace('spec["branch"] = parse_branch_ref(git_head_path)', 'spec["branch"] = "v2.21.0"')
+t = t.replace('return unknown_label', 'return b"v2.21.0"')
+
+with open(p, 'w') as f:
+    f.write(t)
+PYEOF
+
+
 
 # ---------- Passo 12: BUILD ----------
 echo "=== 12/13: Iniciando compilação (isso vai demorar 4-8 horas) ==="

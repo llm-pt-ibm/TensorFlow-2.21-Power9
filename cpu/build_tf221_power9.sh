@@ -663,15 +663,20 @@ sed -i 's|#include "third_party/tensorrt/tensorrt_config.h"|#define TF_TENSORRT_
 sed -i 's|#include "third_party/gpus/rocm/rocm_config.h"|#define TF_ROCM_VERSION "0"|g' third_party/xla/xla/tsl/platform/default/dso_loader.cc
 sed -i 's|#include "third_party/nccl/nccl_config.h"|#define TF_NCCL_VERSION "0"|g' third_party/xla/xla/tsl/platform/default/dso_loader.cc
 
-# 10K — Patch XLA group_events.cc (Bug GCC 13 NoDestructor Ambiguity)
+# 10K — Patch XLA group_events.cc (Bug GCC NoDestructor Ambiguity — resilient to any absl version)
 echo "Patching XLA group_events.cc NoDestructor..."
 python3 - << 'PYEOF'
 import re
 p = 'third_party/xla/xla/tsl/profiler/utils/group_events.cc'
 with open(p, 'r') as f:
     t = f.read()
-# Match 'NoDestructor' followed by anything except '(' then '(' and '{'
-t = re.sub(r'(NoDestructor[^\(]+)\s*\(\s*\{', r'\1(absl::flat_hash_set<int64_t>{', t)
+# Replace NoDestructor<flat_hash_set<int64_t>> with static const auto* = new ...
+# This avoids the ambiguous constructor issue across all absl versions
+t = re.sub(
+    r'static\s+(?:const\s+)?absl::NoDestructor\s*<((?:(?!static\s+(?:const\s+)?absl::NoDestructor)[\s\S])+?)>\s+(\w+)\s*\(',
+    r'static const auto* \2 =\n      new \1(',
+    t
+)
 with open(p, 'w') as f:
     f.write(t)
 PYEOF
@@ -687,14 +692,19 @@ with open(p, 'w') as f:
     f.write(t)
 PYEOF
 
-# 10M — Patch MLIR fuse_qdq_pass.cc (Bug GCC 13 NoDestructor Ambiguity)
+# 10M — Patch MLIR fuse_qdq_pass.cc (Bug GCC NoDestructor Ambiguity — resilient to any absl version)
 echo "Patching MLIR fuse_qdq_pass.cc NoDestructor..."
 python3 - << 'PYEOF'
 import re
 p = 'tensorflow/compiler/mlir/lite/transforms/quantization/fuse_qdq_pass.cc'
 with open(p, 'r') as f:
     t = f.read()
-t = re.sub(r'(NoDestructor[^\(]+)\s*\(\s*\{', r'\1(absl::flat_hash_set<std::string>{', t)
+# Replace NoDestructor<flat_hash_set<string>> with static const auto* = new ...
+t = re.sub(
+    r'static\s+(?:const\s+)?absl::NoDestructor\s*<((?:(?!static\s+(?:const\s+)?absl::NoDestructor)[\s\S])+?)>\s+(\w+)\s*\(',
+    r'static const auto* \2 =\n      new \1(',
+    t
+)
 with open(p, 'w') as f:
     f.write(t)
 PYEOF
@@ -788,15 +798,19 @@ for p in glob.glob('third_party/xla/xla/codegen/*.h') + glob.glob('third_party/x
         f.write(t)
 PYEOF
 
-# 10R — Patch XLA ynn_support.cc (Bug GCC 8 Ambiguous NoDestructor initializer list)
+# 10R — Patch XLA ynn_support.cc (Bug GCC NoDestructor Ambiguity — resilient to any absl version)
 echo "Patching ynn_support.cc for NoDestructor ambiguity..."
 python3 - << 'PYEOF'
 import re
 p = 'third_party/xla/xla/backends/cpu/ynn_support.cc'
 with open(p, 'r') as f:
     t = f.read()
-# Note: TypeConfigSet was typedef'd inside a different scope. We must use the full type.
-t = re.sub(r'kAllowedTypes\s*\(\s*\{', r'kAllowedTypes(absl::flat_hash_set<std::tuple<xla::PrimitiveType, xla::PrimitiveType, xla::PrimitiveType>>{', t)
+# Replace NoDestructor<...> with static const auto* = new ...
+t = re.sub(
+    r'static\s+(?:const\s+)?absl::NoDestructor\s*<((?:(?!static\s+(?:const\s+)?absl::NoDestructor)[\s\S])+?)>\s+(\w+)\s*\(',
+    r'static const auto* \2 =\n      new \1(',
+    t
+)
 with open(p, 'w') as f:
     f.write(t)
 PYEOF
@@ -870,7 +884,26 @@ with open(p, 'w') as f:
     f.write(t)
 PYEOF
 
+# 10W — Patch gen_git_source.py (Branch check bypass)
+echo "Patching gen_git_source.py..."
+python3 - << 'PYEOF'
+import re
+p = 'tensorflow/tools/git/gen_git_source.py'
+with open(p, 'r') as f:
+    t = f.read()
+
+# Forçar branch_ref a ser sempre válido ou vazio mas existente
+t = t.replace('spec["branch"] = parse_branch_ref(git_head_path)', 'spec["branch"] = "v2.21.0"')
+t = t.replace('return unknown_label', 'return b"v2.21.0"')
+
+with open(p, 'w') as f:
+    f.write(t)
+PYEOF
+
 # 10V — Patch build_pip_package.py para proteger glob.glob[0] e copytree
+# First, restore the file to its pristine state to avoid double-patching from previous runs
+git checkout -- tensorflow/tools/pip_package/build_pip_package.py 2>/dev/null || true
+
 python3 - << 'PYEOF'
 import re
 
@@ -890,6 +923,9 @@ import shutil
 import os
 import subprocess
 import re
+
+# Sentinel: prevent double-patching on re-runs
+_PPC64LE_PATCHED = True
 
 # Patch 1: Sobreviver a diretórios nulos
 _orig_copytree = shutil.copytree
@@ -925,11 +961,13 @@ def _patched_run(args, **kwargs):
 subprocess.run = _patched_run
 """
 
-if code.startswith("#!"):
-    parts = code.split("\n", 1)
-    code = parts[0] + "\n" + injection + parts[1]
-else:
-    code = injection + "\n" + code
+# Only inject if not already patched (prevents recursion on re-runs)
+if "_PPC64LE_PATCHED" not in code:
+    if code.startswith("#!"):
+        parts = code.split("\n", 1)
+        code = parts[0] + "\n" + injection + parts[1]
+    else:
+        code = injection + "\n" + code
 
 with open(path, "w") as f:
     f.write(code)
@@ -1031,6 +1069,7 @@ echo "=== 12/13: Iniciando compilação (isso vai demorar 4-8 horas) ==="
 NUMPY_INC=$(python3 -c "import numpy; print(numpy.get_include())")
 bazel build \
     --config=opt \
+    --action_env=GIT_TAG_OVERRIDE=v2.21.0 \
     --copt=-fvisibility=default \
     --cxxopt=-fvisibility=default \
     --copt=-DPYBIND11_EXPORT="__attribute__((visibility(\"default\")))" \
