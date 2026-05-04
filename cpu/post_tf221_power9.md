@@ -52,7 +52,7 @@ A arquitetura moderna do TensorFlow (e seu sistema de build, o Bazel 7) abraçou
 
 ### Etapa 1: Compilando o Bazel 7.1.0 do Zero
 
-Como o Google não distribui o Bazel 7 para ppc64le, o primeiro passo para permitir seu uso em arquitetura ppc64le foi compilar o próprio Bazel a partir do seu código-fonte, usando o arquivo `-dist.zip`, que já inclui os artefatos de bootstrap necessários para que o Bazel se autoconstrua sem depender de uma versão anterior de si mesmo. O processo exige Java 21 e leva entre 1 e 2 horas dependendo dos núcleos disponíveis na VM. O ponto crítico aqui é passar as variáveis corretas para o script `compile.sh`. Sem esse passo, nenhuma das etapas seguintes é possível. O comando `bazel build` simplesmente não existe para ppc64le de outra forma. Criamos um tutorial com o processo de instalação do Bazel 7.1 que pode ser acessado no repositório.
+Como o Google não distribui o Bazel 7 para ppc64le, o primeiro passo para permitir seu uso em arquitetura ppc64le foi compilar o próprio Bazel a partir do seu código-fonte, usando o arquivo `-dist.zip`, que já inclui os artefatos de bootstrap necessários para que o Bazel se autoconstrua sem depender de uma versão anterior de si mesmo. O processo exige Java 21 e leva entre 1 e 2 horas dependendo dos núcleos disponíveis na VM. O ponto crítico aqui é passar as variáveis corretas para o script `compile.sh`. Sem esse passo, nenhuma das etapas seguintes é possível. O comando `bazel build` simplesmente não existe para ppc64le de outra forma. Criamos um [tutorial](https://github.com/llm-pt-ibm/TensorFlow-2.21-Power9/blob/main/bazel/tutorial_bazel7_power9.md) com o processo de instalação do Bazel 7.1 que pode ser acessado no repositório.
 
 ### Etapa 2: Estratégia de Bypass — Repositórios Stub
 
@@ -72,7 +72,7 @@ Com a infraestrutura de build resolvida, encontramos 21 incompatibilidades no c�
 2.  Ambiguidades de templates C++ em componentes do XLA e MLIR que o compilador do Google mascara mas o GCC 13 expõe.
 3.  Referências a headers de CUDA e TensorRT que deixam de existir quando substituídos pelos stubs.
 
-Cada incompatibilidade foi resolvida com um patch Python preciso, sem alterar a lógica funcional do TensorFlow. A tabela completa com todos os 21 patches está disponível no repositório.
+Cada incompatibilidade foi resolvida com um patch Python preciso, sem alterar a lógica funcional do TensorFlow. A [tabela completa com todos os 21 patches](https://github.com/llm-pt-ibm/TensorFlow-2.21-Power9/blob/main/cpu/tutorial_tf221_power9.md) está disponível no repositório.
 
 ### Etapa 4: A Compilação
 
@@ -82,7 +82,7 @@ Com todos os patches aplicados, a compilação final é disparada com um único 
 
 Para que a comunidade não precise refazer todo esse complexo processo de build, nós empacotamos o resultado dessa engenharia em uma solução "plug and play".
 
-Disponibilizamos uma Release oficial no repositório contendo o código-fonte já com todos os patches aplicados e o binário `.whl` gerado nativamente. Mais importante ainda: criamos e publicamos uma receita Conda completa que resolve de forma automática os clássicos problemas de compatibilidade de bibliotecas C++ (GLIBCXX e GCC mismatch) comuns no Power9.
+Disponibilizamos uma [Release oficial](https://github.com/llm-pt-ibm/tensorflow/releases/tag/v2.21.0-cpu-only) no repositório contendo o código-fonte já com todos os patches aplicados e o binário `.whl` gerado nativamente. Mais importante ainda: criamos e publicamos uma receita Conda completa que resolve de forma automática os clássicos problemas de compatibilidade de bibliotecas C++ (GLIBCXX e GCC mismatch) comuns no Power9.
 
 Agora, o TensorFlow 2.21 nativo pode ser instalado diretamente através do nosso canal Conda, proporcionando a mesma experiência de instalação oficial de distribuições corporativas.
 
@@ -96,7 +96,7 @@ conda activate tf221
 conda install -c ufcg-ibm -c conda-forge tensorflow-cpu=2.21.0 -y
 ```
 
-Um tutorial detalhado de instalação via Conda também está disponível no nosso repositório.
+Um [tutorial detalhado de instalação via Conda](https://github.com/llm-pt-ibm/TensorFlow-2.21-Power9/blob/main/cpu/install-tensorflow-ppc64le.md) também está disponível no nosso repositório.
 
 ## Resultado Funcional no servidor IBM Power9
 
@@ -110,10 +110,10 @@ Ferramentas de IA da IBM como AIF360, AIX360 e ART, já eram compatíveis com o 
 
 Todo o processo e os artefatos gerados estão documentados e disponíveis em nosso repositório:
 
-- **Release oficial:** Código-fonte alterado e o binário `.whl` pronto.
-- **tutorial_instalacao_conda.md:** Guia prático para instalar a versão 2.21 diretamente pelo nosso canal Conda.
-- **tutorial_bazel7_power9.md:** Compilação do Bazel 7.1.0 a partir do código-fonte.
-- **tutorial_tf221_power9.md:** Compilação do TensorFlow 2.21 com todos os patches.
+- **[Release oficial](https://github.com/llm-pt-ibm/tensorflow/releases/tag/v2.21.0-cpu-only):** Código-fonte alterado e o binário `.whl` pronto.
+- **[tutorial_instalacao_conda.md](https://github.com/llm-pt-ibm/TensorFlow-2.21-Power9/blob/main/cpu/install-tensorflow-ppc64le.md):** Guia prático para instalar a versão 2.21 diretamente pelo nosso canal Conda.
+- **[tutorial_bazel7_power9.md](https://github.com/llm-pt-ibm/TensorFlow-2.21-Power9/blob/main/bazel/tutorial_bazel7_power9.md):** Compilação do Bazel 7.1.0 a partir do código-fonte.
+- **[tutorial_tf221_power9.md](https://github.com/llm-pt-ibm/TensorFlow-2.21-Power9/blob/main/cpu/tutorial_tf221_power9.md):** Compilação do TensorFlow 2.21 com todos os patches.
 
 ## Impacto
 
