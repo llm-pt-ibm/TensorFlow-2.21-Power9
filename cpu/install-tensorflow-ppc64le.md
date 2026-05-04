@@ -41,16 +41,6 @@ conda activate your_environment
 conda install -c ufcg-ibm -c conda-forge tensorflow-cpu=2.21.0 -y
 ```
 
-### Option 3 — Configure channels globally (install once)
-
-If you use TensorFlow frequently, configure the channels once and you'll never need to declare them again:
-
-```bash
-conda config --add channels conda-forge
-conda config --add channels ufcg-ibm
-conda config --set channel_priority flexible
-```
-
 After that, simply install with:
 
 ```bash
@@ -156,17 +146,6 @@ The package automatically resolves and installs all the dependencies below witho
 | absl-py | Google utilities |
 | requests | HTTP requests |
 | libstdcxx-ng | Standard C++ library |
-
----
-
-## Common Issues
-
-| Error | Cause | Solution |
-|---|---|---|
-| `Illegal instruction (core dumped)` | Binary not compatible with CPU | Confirm it is ppc64le with `uname -m` |
-| `ImportError: libstdc++.so` | Missing C++ library | `conda install libstdcxx-ng` |
-| `PackagesNotFoundError` | Channel not declared | Use `-c ufcg-ibm -c conda-forge` |
-| `UserWarning: Do not pass input_shape` | Keras 3.x installed | Use `tf.keras.Input(shape=...)` as the first layer |
 
 ---
 
