@@ -41,14 +41,6 @@ conda activate your_environment
 conda install -c ufcg-ibm -c conda-forge tensorflow-cpu=2.21.0 -y
 ```
 
-After that, simply install with:
-
-```bash
-conda install tensorflow-cpu=2.21.0 -y
-```
-
----
-
 ## Verifying the Installation
 
 ### Test 1 — Version
