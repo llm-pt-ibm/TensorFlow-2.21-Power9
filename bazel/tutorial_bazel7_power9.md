@@ -1,29 +1,29 @@
-# Passo a Passo: Compilando Bazel 7.1.0 no Power9 (ppc64le)
+# Step-by-Step: Compiling Bazel 7.1.0 on Power9 (ppc64le)
 
-Execute os blocos abaixo um por vez no terminal da sua VM Power9.
-**Atenção:** Esse é um processo pesado (bootstrapping). Pode demorar de 1 a 2 horas dependendo dos núcleos da sua VM.
+Execute the blocks below one by one in your Power9 VM terminal.
+**Warning:** This is a resource-intensive process (bootstrapping). It may take 1 to 2 hours depending on your VM's cores.
 
-### Passo 1: Instalar dependências de sistema pesadas
-O Bazel 7 exige obrigatoriamente o Java 21 para compilar do zero.
+### Step 1: Install Heavy System Dependencies
+Bazel 7 strictly requires Java 21 to compile from scratch.
 
 ```bash
 sudo dnf install -y gcc gcc-c++ java-21-openjdk-devel zip unzip python3 wget
 ```
 
-### Passo 2: Criar e entrar em uma pasta de trabalho
+### Step 2: Create and Enter a Working Directory
 ```bash
 mkdir -p ~/bazel_source
 cd ~/bazel_source
 ```
 
-### Passo 3: Baixar o código-fonte de distribuição
-Atenção: tem que ser o arquivo `-dist.zip` (ele contém arquivos gerados necessários para o bootstrap que não vêm no git clone).
+### Step 3: Download the Distribution Source Code
+**Warning:** It must be the `-dist.zip` file (it contains necessary generated files for bootstrapping that are not included in a git clone).
 
 ```bash
 wget -q --show-progress https://github.com/bazelbuild/bazel/releases/download/7.1.0/bazel-7.1.0-dist.zip
 ```
 
-### Passo 4: Descompactar o código
+### Step 4: Unpack the Code
 ```bash
 rm -rf bazel-7.1.0
 mkdir bazel-7.1.0
@@ -31,36 +31,36 @@ cd bazel-7.1.0
 unzip -q ../bazel-7.1.0-dist.zip
 ```
 
-### Passo 5: Exportar variáveis de compilação
-Este é o passo mais importante. O Bazel precisa saber qual Java usar internamente, e precisamos limitar a RAM.
+### Step 5: Export Compilation Variables
+This is the most important step. Bazel needs to know which Java to use internally, and we need to limit the RAM.
 
 ```bash
 export EXTRA_BAZEL_ARGS="--host_javabase=@local_jdk//:jdk --local_ram_resources=HOST_RAM*.6"
 export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
 ```
 
-### Passo 6: Iniciar o compilação (O Bootstrap)
-Deixe rodando e vá tomar um café (ou assistir a um filme).
+### Step 6: Start Compilation (The Bootstrap)
+Let it run and go grab a coffee (or watch a movie).
 
 ```bash
 env EXTRA_BAZEL_ARGS="${EXTRA_BAZEL_ARGS}" bash ./compile.sh
 ```
 
-### Passo 7: Instalar o binário gerado
-Após a conclusão bem sucedida, o arquivo executável estará na pasta `output`. Vamos movê-lo para a pasta principal do Linux.
+### Step 7: Install the Generated Binary
+After successful completion, the executable file will be in the `output` folder. Let's move it to the main Linux binary path.
 
 ```bash
 sudo cp output/bazel /usr/local/bin/bazel
 sudo chmod +x /usr/local/bin/bazel
 ```
 
-### Passo 8: Validar a instalação
+### Step 8: Validate the Installation
 ```bash
 bazel --version
-# A saída deve mostrar: bazel 7.1.0
+# Output should show: bazel 7.1.0
 ```
 
 ---
 
-Após concluir com sucesso, você terá o Bazel 7 nativo da sua máquina. 
-Com isso, você pode voltar para o arquivo `tutorial_tf221_power9.md`, pular completamente o Passo 2 e o Passo 4, e ir direto pro abraço no TensorFlow 2.21!
+After successfully completing this, you will have native Bazel 7 on your machine. 
+With this, you can return to the `tutorial_tf221_power9.md` file, completely skip Step 2 and Step 4, and go straight to the TensorFlow 2.21 build!

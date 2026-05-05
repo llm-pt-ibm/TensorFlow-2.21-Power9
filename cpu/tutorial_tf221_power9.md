@@ -73,7 +73,7 @@ echo -e "\n\n\n\n\n\n\n\n\n\n" | ./configure
 ```
 
 ### Step 7: Fix the "local.bzl" bug in rules_ml_toolchain
-O Bazel 7.1.0 removeu o arquivo `local.bzl`. Vamos baixar o pacote problemático, consertá-lo e depois usá-lo localmente em `$HOME/rules_ml_toolchain_patched`:
+Bazel 7.1.0 removed the `local.bzl` file. We will download the problematic package, fix it, and then use it locally at `$HOME/rules_ml_toolchain_patched`:
 
 ```bash
 cd ~
@@ -87,7 +87,7 @@ cd $TF_BUILD_DIR/tensorflow
 ```
 
 ### Step 8: Create LLVM Stub Repos (NEW — Prevents LLVM download)
-O `rules_ml_toolchain` tenta baixar binários do LLVM/Clang para x86_64 e aarch64, que obviamente não rodam no Power9. A solução é criar repositórios "stub" vazios e injetá-los via `--override_repository`:
+The `rules_ml_toolchain` tries to download LLVM/Clang binaries for x86_64 and aarch64, which obviously don't run on Power9. The solution is to create empty "stub" repositories and inject them via `--override_repository`:
 
 ```bash
 # --- LLVM stub ---
@@ -340,7 +340,7 @@ EOF
 The build system (Bazel) is strict and tries to download isolated Python packages, but these pre-compiled versions do not work on Power9. To work around this, we create empty "fake" files (stubs) on the machine, tricking Bazel into believing it downloaded them, but forcing it to use the actual Python libraries we already installed in our Conda environment (Step 2).
 
 ```bash
-# --- PyPI stub (para bibliotecas Pip herméticas) ---
+# --- PyPI stub (for hermetic Pip libraries) ---
 mkdir -p $HOME/pypi_stub
 touch $HOME/pypi_stub/WORKSPACE
 cat > $HOME/pypi_stub/BUILD << 'EOF'
@@ -482,15 +482,15 @@ cd $TF_BUILD_DIR/tensorflow
 
 cat > /tmp/patch_workspace3.py << 'PYEOF'
 """
-Patch WORKSPACE para ppc64le: comenta BLOCOS INTEIROS (statements)
-que contenham referências a CUDA, NCCL, NVSHMEM, LLVM toolchains.
+Patch WORKSPACE for ppc64le: comments out ENTIRE BLOCKS (statements)
+that contain references to CUDA, NCCL, NVSHMEM, LLVM toolchains.
 """
 
 with open("WORKSPACE", "r") as f:
     lines = f.readlines()
 
-# 1. Parsear o arquivo em "statements" (blocos top-level com parênteses balanceados)
-statements = []  # lista de (start_idx, end_idx, [lines])
+# 1. Parse the file into "statements" (top-level blocks with balanced parentheses)
+statements = []  # list of (start_idx, end_idx, [lines])
 current_block = []
 block_start = 0
 paren_depth = 0
@@ -498,12 +498,12 @@ paren_depth = 0
 for i, line in enumerate(lines):
     stripped = line.strip()
 
-    # Linha vazia ou comentário fora de um bloco = separador
+    # Empty line or comment outside a block = separator
     if paren_depth == 0 and (stripped == "" or stripped.startswith("#")):
         if current_block:
             statements.append((block_start, i - 1, current_block))
             current_block = []
-        statements.append((i, i, [line]))  # preservar linha vazia/comentário
+        statements.append((i, i, [line]))  # preserve empty line/comment
         continue
 
     if not current_block:
@@ -512,7 +512,7 @@ for i, line in enumerate(lines):
     current_block.append(line)
     paren_depth += line.count("(") - line.count(")")
 
-    # Bloco fechou (parênteses balanceados)
+    # Block closed (balanced parentheses)
     if paren_depth <= 0:
         paren_depth = 0
         statements.append((block_start, i, current_block))
@@ -521,7 +521,7 @@ for i, line in enumerate(lines):
 if current_block:
     statements.append((block_start, len(lines) - 1, current_block))
 
-# 2. Padrões para identificar statements que devem ser comentados
+# 2. Patterns to identify statements that must be commented out
 skip_patterns = [
     "cc_toolchain_deps",
     "register_toolchains",
@@ -549,7 +549,7 @@ skip_patterns = [
     "cuda_nvvm",
 ]
 
-# 3. Para cada statement, checar se contém algum padrão → comentar TUDO
+# 3. For each statement, check if it contains any pattern → comment EVERYTHING
 new_lines = []
 commented = 0
 for start, end, block_lines in statements:
@@ -566,7 +566,7 @@ for start, end, block_lines in statements:
 with open("WORKSPACE", "w") as f:
     f.writelines(new_lines)
 
-print(f"OK: WORKSPACE patched — {commented} blocos comentados")
+print(f"OK: WORKSPACE patched — {commented} blocks commented out")
 PYEOF
 python3 /tmp/patch_workspace3.py
 ```
@@ -613,7 +613,7 @@ PYEOF
 python3 /tmp/patch_toolchains.py
 ```
 
-**10C — Redirecionar pip_parse para usar o wrapper Python:**
+**10C — Redirect pip_parse to use the Python wrapper:**
 ```bash
 cat > /tmp/patch_pip.py << 'PYEOF'
 path = "third_party/xla/third_party/py/python_init_pip.bzl"
@@ -635,7 +635,7 @@ PYEOF
 python3 /tmp/patch_pip.py
 ```
 
-**Verificação rápida:**
+**Quick check:**
 ```bash
 echo "--- toolchains ---"
 grep -n "pass" third_party/xla/third_party/py/python_init_toolchains.bzl
@@ -643,7 +643,7 @@ echo "--- pip ---"
 grep -n "python_interpreter" third_party/xla/third_party/py/python_init_pip.bzl
 ```
 
-**10D — Patch do `setup_py_nvidia_dependencies_util.py`** (evita KeyError em versões CUDA inexistentes):
+**10D — Patch `setup_py_nvidia_dependencies_util.py`** (avoids KeyError on non-existent CUDA versions):
 ```bash
 sed -i 's/nvidia_wheel_versions\[$/nvidia_wheel_versions.get(/' \
     third_party/xla/third_party/py/setup_py_nvidia_dependencies_util.py
@@ -655,23 +655,23 @@ sed -i 's/  \].items():/  ).items():/' \
     third_party/xla/third_party/py/setup_py_nvidia_dependencies_util.py
 ```
 
-**10E — Patch XLA `builtin_fp16.h`** (corrige erro faltando `<cstdint>` no GCC 13+):
+**10E — Patch XLA `builtin_fp16.h`** (fixes error missing `<cstdint>` on GCC 13+):
 ```bash
 sed -i '1s/^/#include <cstdint>\n/' third_party/xla/xla/backends/cpu/codegen/builtin_fp16.h
 ```
 
-**10F — Remover flags específicas de x86/Clang do XLA** (corrige compilador GCC no Power9):
+**10F — Remove x86/Clang specific flags from XLA** (fixes GCC compiler on Power9):
 ```bash
 find third_party/xla/xla -type f \( -name "BUILD" -o -name "*.bzl" \) | xargs sed -i 's/"-mprefer-vector-width=512"/""/g; s/"-fno-experimental-sanitize-metadata=all"/""/g'
 find third_party/xla/xla -type f \( -name "BUILD" -o -name "*.bzl" \) | xargs sed -i "s/'-mprefer-vector-width=512'/''/g; s/'-fno-experimental-sanitize-metadata=all'/''/g"
 ```
 
-**10G — Patch XLA `eigen_unary.cc`** (Bug do GCC com macros exclusivas do Clang):
+**10G — Patch XLA `eigen_unary.cc`** (GCC bug with Clang-exclusive macros):
 ```bash
 sed -i 's/defined(__has_builtin) && __has_builtin(__builtin_vectorelements)/0/g' third_party/xla/xla/codegen/intrinsic/cpp/eigen_unary.cc
 ```
 
-**10H — Patch BoringSSL** (Burlar bloqueio de "Unknown target CPU" para Power9):
+**10H — Patch BoringSSL** (Bypass "Unknown target CPU" block for Power9):
 ```bash
 bazel fetch @boringssl//:crypto || true
 BASE_H="$(bazel info output_base)/external/boringssl/src/include/openssl/base.h"
@@ -681,14 +681,14 @@ if [ -f "$BASE_H" ]; then
 fi
 ```
 
-**10I — Patch XLA `shape.h` e `.cc`** (Conserta bug de disparidade do `noexcept` no GCC 13 para PPC):
+**10I — Patch XLA `shape.h` and `.cc`** (Fixes `noexcept` mismatch bug in GCC 13 for PPC):
 ```bash
 sed -i 's/Shape(Shape&&) noexcept;/Shape(Shape\&\&);/g' third_party/xla/xla/shape.h
 sed -i 's/operator=(Shape&&) noexcept;/operator=(Shape\&\&);/g' third_party/xla/xla/shape.h
 sed -i 's/) noexcept = default;/) = default;/g' third_party/xla/xla/shape.cc
 ```
 
-**10J — Patch XLA `dso_loader.cc`** (Remove includes de CUDA/TensorRT que deixaram de existir no Stub):
+**10J — Patch XLA `dso_loader.cc`** (Removes CUDA/TensorRT includes that no longer exist in the Stub):
 ```bash
 sed -i 's|#include "third_party/gpus/cuda/cuda_config.h"|#define TF_CUDA_VERSION "0"\n#define TF_CUDNN_VERSION "0"\n#define TF_CUDART_VERSION "0"\n#define TF_CUPTI_VERSION "0"\n#define TF_CUBLAS_VERSION "0"\n#define TF_CUSOLVER_VERSION "0"\n#define TF_CUFFT_VERSION "0"\n#define TF_CUSPARSE_VERSION "0"|g' third_party/xla/xla/tsl/platform/default/dso_loader.cc
 sed -i 's|#include "third_party/tensorrt/tensorrt_config.h"|#define TF_TENSORRT_VERSION "0"|g' third_party/xla/xla/tsl/platform/default/dso_loader.cc
@@ -696,7 +696,7 @@ sed -i 's|#include "third_party/gpus/rocm/rocm_config.h"|#define TF_ROCM_VERSION
 sed -i 's|#include "third_party/nccl/nccl_config.h"|#define TF_NCCL_VERSION "0"|g' third_party/xla/xla/tsl/platform/default/dso_loader.cc
 ```
 
-**10K — Patch XLA `group_events.cc`** (Conserta ambiguidade do GCC 13 com `absl::NoDestructor`):
+**10K — Patch XLA `group_events.cc`** (Fixes GCC 13 ambiguity with `absl::NoDestructor`):
 ```bash
 python3 - << 'PYEOF'
 import re
@@ -709,7 +709,7 @@ with open(p, 'w') as f:
 PYEOF
 ```
 
-**10L — Patch MLIR `fuse_qdq_pass.cc`** (Mesmo erro do GCC 13 com `absl::NoDestructor`, mas agora esperado tipo `std::string`):
+**10L — Patch MLIR `fuse_qdq_pass.cc`** (Same GCC 13 error with `absl::NoDestructor`, but now expecting `std::string` type):
 ```bash
 python3 - << 'PYEOF'
 import re
@@ -722,7 +722,7 @@ with open(p, 'w') as f:
 PYEOF
 ```
 
-**10M — Patch XLA `allocation_value.h`** (Resolver recusa de Vetor C++ em mover objetos no GCC 8/13):
+**10M — Patch XLA `allocation_value.h`** (Resolve C++ Vector refusal to move objects in GCC 8/13):
 ```bash
 python3 - << 'PYEOF'
 import re
@@ -739,7 +739,7 @@ with open(p, 'w') as f:
 PYEOF
 ```
 
-**10N — Patch XLA `hlo_sharding_util.h`** (Resolver ambiguidade de Span vs Iota em Listas do C++):
+**10N — Patch XLA `hlo_sharding_util.h`** (Resolve Span vs Iota ambiguity in C++ Lists):
 ```bash
 python3 - << 'PYEOF'
 import re
@@ -756,7 +756,7 @@ with open(p, 'w') as f:
 PYEOF
 ```
 
-**10O — Patch MLIR TFLite `optimize_pass.cc`** (Bug de CTAD no `std::multiplies` do GCC 8):
+**10O — Patch MLIR TFLite `optimize_pass.cc`** (CTAD bug in GCC 8 `std::multiplies`):
 ```bash
 python3 - << 'PYEOF'
 p = 'tensorflow/compiler/mlir/lite/transforms/optimize_pass.cc'
@@ -768,7 +768,7 @@ with open(p, 'w') as f:
 PYEOF
 ```
 
-**10P — Patch DTensor MLIR** (Falta de Namespace `llvm::cast` estendido a todos os arquivos):
+**10P — Patch DTensor MLIR** (Missing `llvm::cast` Namespace extended to all files):
 ```bash
 python3 - << 'PYEOF'
 import glob
@@ -785,7 +785,7 @@ for p in glob.glob('tensorflow/dtensor/mlir/*.cc'):
 PYEOF
 ```
 
-**10Q — Patch XLA CPU Emitter** (Remover estrito `noexcept` de Construtores Múltiplos e sanar init brace do GCC):
+**10Q — Patch XLA CPU Emitter** (Remove strict `noexcept` from Multiple Constructors and fix GCC brace init):
 ```bash
 python3 - << 'PYEOF'
 import glob
@@ -884,7 +884,7 @@ with open(p, 'w') as f:
 PYEOF
 ```
 
-**10V — Patch build_pip_package.py para proteger glob.glob[0] e copytree**
+**10V — Patch build_pip_package.py to protect glob.glob[0] and copytree**
 ```bash
 python3 - << 'PYEOF'
 import re
@@ -893,7 +893,7 @@ path = "tensorflow/tools/pip_package/build_pip_package.py"
 with open(path, "r") as f:
     code = f.read()
 
-# 1. Protege o glob()
+# 1. Protects glob()
 def glob0_safe(m):
     expr = m.group(1)
     return f"({expr}[0] if {expr} else None)"
@@ -906,17 +906,17 @@ import os
 import subprocess
 import re
 
-# Patch 1: Sobreviver a diretórios nulos
+# Patch 1: Survive null directories
 _orig_copytree = shutil.copytree
 def _robust_copytree(src, dst, *args, **kwargs):
     if not src or not os.path.exists(str(src)):
-        print(f"AVISO: Diretório ausente ignorado -> {src}")
+        print(f"WARNING: Missing directory ignored -> {src}")
         return
     kwargs['dirs_exist_ok'] = True
     try:
         return _orig_copytree(src, dst, *args, **kwargs)
     except Exception as e:
-        print(f"AVISO: Erro ignorado ao copiar {src}: {e}")
+        print(f"WARNING: Error ignored while copying {src}: {e}")
         return
 
 shutil.copytree = _robust_copytree
@@ -930,11 +930,11 @@ def _patched_run(args, **kwargs):
         if os.path.exists(setup_path):
             with open(setup_path, "r") as f:
                 c = f.read()
-            # Adiciona aspas em versões numéricas que causariam erro de sintaxe
+            # Add quotes to numeric versions that would cause syntax error
             c = re.sub(r"(\w+_version\s*=\s*)([0-9\.]+)", r"\g<1>'\g<2>'", c)
             with open(setup_path, "w") as f:
                 f.write(c)
-            print(f"\\n[!!!] SUCESSO: setup.py interceptado e corrigido na pasta {cwd}! [!!!]\\n")
+            print(f"\\n[!!!] SUCCESS: setup.py intercepted and fixed in folder {cwd}! [!!!]\\n")
     return _orig_run(args, **kwargs)
 
 subprocess.run = _patched_run
@@ -949,7 +949,7 @@ else:
 with open(path, "w") as f:
     f.write(code)
 
-print("OK: Super-Patch V2 aplicado com sucesso!")
+print("OK: Super-Patch V2 applied successfully!")
 PYEOF
 ```
 
@@ -981,14 +981,15 @@ PYEOF
 TensorFlow hides certain C++ functions by default so as not to pollute programs, but on Power9 this prevents the Python library from finding the compiled functions. This Python script enters the `pybind11` rules and alters them to make everything visible.
 > **Root Cause:** The `pybind_library` macro in `pybind11_bazel/build_defs.bzl` injects
 > `-fvisibility=hidden` into **all** pybind11 packages (`pybind11_protobuf`, `pybind11_abseil`,
-> etc), ganhando de `--copt=-fvisibility=default`. A correção definitiva é remover essa flag
-> direto da raiz. **Requer que o cache do Bazel já esteja populado** (rode após um `bazel build`
-> ou fetch prévio).
+> `-fvisibility=hidden` into **all** pybind11 packages (`pybind11_protobuf`, `pybind11_abseil`,
+> etc), overriding `--copt=-fvisibility=default`. The definitive fix is to remove this flag
+> directly from the root. **Requires the Bazel cache to be already populated** (run after a `bazel build`
+> or previous fetch).
 
 ```bash
 cd $TF_BUILD_DIR/tensorflow
 
-# Desinstalar TF instalado (evita conflito no ExtractAPI step)
+# Uninstall installed TF (avoids conflict in ExtractAPI step)
 pip uninstall tensorflow -y || true
 
 python3 - << 'PYEOF'
@@ -1003,8 +1004,8 @@ if os.path.exists(pybind_bzl):
     os.chmod(pybind_bzl, 0o644)
     with open(pybind_bzl, 'r') as f:
         content = f.read()
-    # AVISO: Starlark NAO aceita comentarios # dentro de listas.
-    content = content.replace('"" # -fvisibility=hidden disabled for ppc64le', '')  # limpar patch anterior
+    # WARNING: Starlark does NOT accept # comments inside lists.
+    content = content.replace('"" # -fvisibility=hidden disabled for ppc64le', '')  # clean previous patch
     content = content.replace("'' # -fvisibility=hidden disabled for ppc64le", '')
     content = content.replace('"-fvisibility=hidden"', '""')
     content = content.replace("'-fvisibility=hidden'", "''")
@@ -1013,9 +1014,9 @@ if os.path.exists(pybind_bzl):
     content = re.sub(r"\[\s*''\s*\]", '[]', content)
     with open(pybind_bzl, 'w') as f:
         f.write(content)
-    print(f"OK: pybind11_bazel/build_defs.bzl patchado")
+    print(f"OK: pybind11_bazel/build_defs.bzl patched")
 else:
-    print(f"AVISO: {pybind_bzl} nao encontrado ainda (sera patchado apos primeiro fetch)")
+    print(f"WARNING: {pybind_bzl} not found yet (will be patched after first fetch)")
 
 # 2. Patch de visibilidade irrestrita para TODOS os pacotes auxiliares pybind11 (abseil, protobuf, status)
 import glob
@@ -1040,15 +1041,15 @@ def enforce_visibility(search_path_pattern):
                 content = content.rstrip() + '\n\n#pragma GCC visibility pop\n'
                 with open(path, 'w') as f:
                     f.write(content)
-                print(f"Visibilidade forçada em: {path}")
+                print(f"Visibility forced in: {path}")
 
-# Garantir visibilidade irrestrita p/ status e utils
+# Ensure unrestricted visibility for status and utils
 enforce_visibility(f"{base}/external/pybind11_protobuf/pybind11_protobuf/**/*.h")
 enforce_visibility(f"{base}/external/pybind11_protobuf/pybind11_protobuf/**/*.cc")
 enforce_visibility(f"{base}/external/pybind11_abseil/**/*.h")
 enforce_visibility(f"{base}/external/pybind11_abseil/**/*.cc")
 
-print("=== Todos os patches de visibilidade aplicados! ===")
+print("=== All visibility patches applied! ===")
 PYEOF
 ```
 
