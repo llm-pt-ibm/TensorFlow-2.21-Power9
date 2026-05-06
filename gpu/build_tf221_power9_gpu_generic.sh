@@ -38,7 +38,7 @@ conda activate tf221_build
 # Os pacotes -dev trazem os headers (.h) necessários para compilação (cusolverDn.h, cublas_v2.h, etc.)
 conda install -c conda-forge cuda-cudart cuda-cudart-dev cuda-libraries cuda-nvrtc cuda-nvcc \
     libcusolver-dev libcublas-dev libcusparse-dev libcufft-dev libcurand-dev cuda-cupti-dev \
-    nccl -y
+    nccl gcc_linux-ppc64le=11.4 gxx_linux-ppc64le=11.4 -y
 
 cd $TF_BUILD_DIR
 rm -rf tensorflow
@@ -74,11 +74,11 @@ if [ $IS_CUDA -eq 1 ]; then
             -fno-*) ;;
             -fstack-protector*) ;;
             -Wall) ;;
-            -O*) CLEAN_ARGS+=("-O3") ;;
+            -O*) CLEAN_ARGS+=("$arg") ;;
             *) CLEAN_ARGS+=("$arg") ;;
         esac
     done
-    CLEAN_ARGS+=("-x" "cu" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I$HOME/local_config_cuda_stub/cuda/cuda_include" "-I/usr/local/cuda/include")
+    CLEAN_ARGS+=("-x" "cu" "-O0" "--ptxas-options=-O0" "--compiler-options=-O0" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I$HOME/local_config_cuda_stub/cuda/cuda_include" "-I/usr/local/cuda/include")
     exec $REAL_NVCC "${CLEAN_ARGS[@]}"
 else
     exec $REAL_GCC "$@"
@@ -107,11 +107,11 @@ if [ $IS_CUDA -eq 1 ]; then
             -fno-*) ;;
             -fstack-protector*) ;;
             -Wall) ;;
-            -O*) CLEAN_ARGS+=("-O3") ;;
+            -O*) CLEAN_ARGS+=("$arg") ;;
             *) CLEAN_ARGS+=("$arg") ;;
         esac
     done
-    CLEAN_ARGS+=("-x" "cu" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I$HOME/local_config_cuda_stub/cuda/cuda_include" "-I/usr/local/cuda/include")
+    CLEAN_ARGS+=("-x" "cu" "-O0" "--ptxas-options=-O0" "--compiler-options=-O0" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I$HOME/local_config_cuda_stub/cuda/cuda_include" "-I/usr/local/cuda/include")
     exec $REAL_NVCC "${CLEAN_ARGS[@]}"
 else
     exec $REAL_GCC "$@"
@@ -139,7 +139,7 @@ export PYTHON_BIN_PATH=$(which python3)
 export PYTHON_LIB_PATH=$(python3 -c 'import site; print(site.getsitepackages()[0])')
 export TF_CONFIGURE_IOS=0
 export TF_CUDA_CLANG=0
-export TF_CUDA_COMPUTE_CAPABILITIES="3.5,7.0"
+export TF_CUDA_COMPUTE_CAPABILITIES="7.0"
 export CC_OPT_FLAGS="-mno-float128"
 export GCC_HOST_COMPILER_PATH=$(which gcc)
 
@@ -1767,7 +1767,7 @@ unset NVCC_PREPEND_FLAGS
 ARGS=()
 IS_CUDA=0
 REAL_NVCC="/root/cuda_unified/bin/nvcc"
-REAL_GCC="/usr/bin/gcc"
+REAL_GCC="$(which powerpc64le-conda-linux-gnu-gcc 2>/dev/null || echo /usr/bin/gcc)"
 
 clean_asm() {
     if [[ "$1" == *.S || "$1" == *.s ]] && [ -f "$1" ]; then
@@ -1861,7 +1861,7 @@ if [ $IS_CUDA -eq 1 ]; then
             -f*|-W*)
                 # Strip all -f and -W flags completely
                 ;;
-            -O*) CLEAN_ARGS+=("-O3") ;;
+            -O*) CLEAN_ARGS+=("$arg") ;;
             -iquote)
                 CLEAN_ARGS+=("-I" "${EXPANDED_ARGS[$i+1]}")
                 SKIP_NEXT_ARG=1
@@ -1877,11 +1877,11 @@ if [ $IS_CUDA -eq 1 ]; then
         esac
     done
     
-    CLEAN_ARGS+=("-x" "cu" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I$HOME/local_config_cuda_stub/cuda/cuda_include" "-I/usr/local/cuda/include" "--forward-unknown-to-host-compiler")
+    CLEAN_ARGS+=("-x" "cu" "-O0" "--ptxas-options=-O0" "--compiler-options=-O0" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I/usr/local/include/cuda_stub" "-I/usr/local/cuda/include" "--forward-unknown-to-host-compiler")
     echo "NVCC ARGS: ${CLEAN_ARGS[@]}" >> /tmp/nvcc_dump.txt
     exec $REAL_NVCC "${CLEAN_ARGS[@]}"
 else
-    exec $REAL_GCC "${ARGS[@]}"
+    exec $REAL_GCC "-isystem/usr/local/include/cuda_stub" "${ARGS[@]}"
 fi
 WRAPPER_EOF
 chmod +x $HOME/gcc_cuda_wrapper.sh
@@ -1893,7 +1893,7 @@ unset NVCC_PREPEND_FLAGS
 ARGS=()
 IS_CUDA=0
 REAL_NVCC="/root/cuda_unified/bin/nvcc"
-REAL_GCC="/usr/bin/g++"
+REAL_GCC="$(which powerpc64le-conda-linux-gnu-g++ 2>/dev/null || echo /usr/bin/g++)"
 
 clean_asm() {
     if [[ "$1" == *.S || "$1" == *.s ]] && [ -f "$1" ]; then
@@ -1987,7 +1987,7 @@ if [ $IS_CUDA -eq 1 ]; then
             -f*|-W*)
                 # Strip all -f and -W flags completely
                 ;;
-            -O*) CLEAN_ARGS+=("-O3") ;;
+            -O*) CLEAN_ARGS+=("$arg") ;;
             -iquote)
                 CLEAN_ARGS+=("-I" "${EXPANDED_ARGS[$i+1]}")
                 SKIP_NEXT_ARG=1
@@ -2003,11 +2003,11 @@ if [ $IS_CUDA -eq 1 ]; then
         esac
     done
     
-    CLEAN_ARGS+=("-x" "cu" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I$HOME/local_config_cuda_stub/cuda/cuda_include" "-I/usr/local/cuda/include" "--forward-unknown-to-host-compiler")
+    CLEAN_ARGS+=("-x" "cu" "-O0" "--ptxas-options=-O0" "--compiler-options=-O0" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I/usr/local/include/cuda_stub" "-I/usr/local/cuda/include" "--forward-unknown-to-host-compiler")
     echo "NVCC ARGS: ${CLEAN_ARGS[@]}" >> /tmp/nvcc_dump.txt
     exec $REAL_NVCC "${CLEAN_ARGS[@]}"
 else
-    exec $REAL_GCC "${ARGS[@]}"
+    exec $REAL_GCC "-isystem/usr/local/include/cuda_stub" "${ARGS[@]}"
 fi
 WRAPPER_EOF
 chmod +x $HOME/gxx_cuda_wrapper.sh
@@ -3042,8 +3042,18 @@ else
     echo ">>> AVISO: Headers do CUDA toolkit não encontrados!"
 fi
 # ==============================================================================
+# Corrige o .tf_configure.bazelrc gerado
+sed -i 's/3\.5,7\.0/7.0/g' .tf_configure.bazelrc 2>/dev/null || true
+sed -i 's/3\.5/7.0/g' .tf_configure.bazelrc 2>/dev/null || true
 
-bazel build \
+# Limpa o cache de objetos CUDA já compilados em sm_35
+bazel_output_base=$(bazel info output_base 2>/dev/null || echo '/tmp')
+if [ "$bazel_output_base" != "/tmp" ]; then
+    find "$bazel_output_base" -name "*.cu.o" -delete 2>/dev/null || true
+    find "$bazel_output_base" -name "*.cu.pic.o" -delete 2>/dev/null || true
+fi
+
+bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --config=cuda \
     --@rules_ml_toolchain//common:enable_cuda=True \
     --repo_env=TF_NEED_CUDA=1 \
@@ -3052,6 +3062,9 @@ bazel build \
     --action_env=GCC_HOST_COMPILER_PATH=$HOME/gcc_cuda_wrapper.sh \
     --define=tflite_with_xnnpack=false \
     --local_ram_resources=HOST_RAM*.6 \
+    --per_file_copt=".*cub_sort_kernel.*@-O0" \
+    --per_file_copt=".*cutlass_gemm_kernel.*@-O0" \
+    --per_file_copt=".*delay_kernel.*@-O0" \
     --per_file_copt=".*@-Wno-error" \
     --copt=-fvisibility=default \
     --cxxopt=-fvisibility=default \
@@ -3062,8 +3075,6 @@ bazel build \
     --linkopt=-Wl,--export-dynamic \
     --linkopt=-Wl,--unresolved-symbols=ignore-all \
     --linkopt=-Wl,--allow-shlib-undefined \
-    --copt=-I/usr/local/include/cuda_stub \
-    --host_copt=-I/usr/local/include/cuda_stub \
     --extra_toolchains=@@local_config_python//:py_cc_toolchain \
     --override_repository=rules_ml_toolchain=$HOME/rules_ml_toolchain_patched \
     --override_repository=llvm_linux_x86_64=$HOME/llvm_stub \
@@ -3140,7 +3151,15 @@ bazel build \
     --repo_env=HERMETIC_PYTHON_VERSION=3.11 \
     --repo_env=USE_HERMETIC_CC_TOOLCHAIN=0 \
     --noincompatible_enable_cc_toolchain_resolution \
-    --jobs=$(nproc) \
+    --discard_analysis_cache \
+    --nokeep_state_after_build \
+    --notrack_incremental_state \
+    --local_resources=cpu=4 \
+    --strategy=CudaCompile=local \
+    --per_file_copt=".*\.cu\.cc@--maxrregcount=64" \
+    --repo_env=TF_CUDA_COMPUTE_CAPABILITIES=7.0 \
+    --define=TF_CUDA_COMPUTE_CAPABILITIES=7.0 \
+    --jobs=4 \
     //tensorflow/tools/pip_package:wheel
 
 # Localizar o .whl gerado
