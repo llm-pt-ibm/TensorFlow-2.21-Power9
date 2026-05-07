@@ -57,7 +57,9 @@ cat << EOF > $HOME/compiler_hijack/gcc
 REAL_GCC="$REAL_GCC_PATH"
 REAL_NVCC="/root/cuda_unified/bin/nvcc"
 EOF
-cat << 'EOF' >> $HOME/compiler_hijack/gcc
+cat << 'WRAPEOF' >> $HOME/compiler_hijack/gcc
+export PATH=/root/miniforge3/nvvm/bin:/root/miniforge3/bin:$PATH
+LOGFILE="/tmp/nvcc_progress.log"
 IS_CUDA=0
 for arg in "$@"; do
     if [[ "$arg" == *.cu.cc ]]; then
@@ -74,23 +76,60 @@ if [ $IS_CUDA -eq 1 ]; then
             -fno-*) ;;
             -fstack-protector*) ;;
             -Wall) ;;
-            -O*) CLEAN_ARGS+=("$arg") ;;
+            -O*) ;;
             *) CLEAN_ARGS+=("$arg") ;;
         esac
     done
-    CLEAN_ARGS+=("-x" "cu" "-O0" "--ptxas-options=-O0" "--compiler-options=-O0" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I$HOME/local_config_cuda_stub/cuda/cuda_include" "-I/usr/local/cuda/include")
-    exec $REAL_NVCC "${CLEAN_ARGS[@]}"
+    CLEAN_ARGS+=("-x" "cu" "-O0" "--ptxas-options=-O0" "--compiler-options=-O0" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I$HOME/local_config_cuda_stub/cuda/cuda_include" "-I/usr/local/cuda/include" "--verbose")
+
+    # Detecta o nome do arquivo .cu.cc sendo compilado
+    SRC_FILE=""
+    for a in "${CLEAN_ARGS[@]}"; do
+        [[ "$a" == *.cu.cc ]] && SRC_FILE="$a"
+    done
+    LABEL=$(basename "${SRC_FILE:-desconhecido}")
+    START_TS=$(date +%s)
+    echo "[NVCC START] $LABEL @ $(date '+%H:%M:%S')" >> "$LOGFILE"
+
+    # Executa NVCC capturando saída verbose para detectar etapas
+    $REAL_NVCC "${CLEAN_ARGS[@]}" 2>&1 | while IFS= read -r line; do
+        echo "$line" >&2
+        # Só detecta linhas de comando reais do NVCC verbose (começam com "#$ ")
+        if [[ "$line" == "#$ "* ]]; then
+            NOW=$(date +%s)
+            ELAPSED=$(( NOW - START_TS ))
+            if [[ "$line" == *"/cicc"* ]]; then
+                PCT=10; DESC="Frontend CUDA → PTX"
+            elif [[ "$line" == *"/ptxas"* ]]; then
+                PCT=60; DESC="PTX → SASS (binário GPU)"
+            elif [[ "$line" == *"/fatbinary"* ]]; then
+                PCT=90; DESC="Empacotando fatbinary"
+            elif [[ "$line" == *"/gcc"* ]] || [[ "$line" == *"/g++"* ]]; then
+                PCT=95; DESC="Host linkagem final"
+            else
+                PCT=50; DESC="Processando"
+            fi
+            echo "[NVCC ${PCT}%] $LABEL | Etapa: $DESC | ${ELAPSED}s" >> "$LOGFILE"
+        fi
+    done
+    EXIT_CODE=${PIPESTATUS[0]}
+    END_TS=$(date +%s)
+    TOTAL=$(( END_TS - START_TS ))
+    echo "[NVCC DONE] $LABEL | Total: ${TOTAL}s | Exit: $EXIT_CODE" >> "$LOGFILE"
+    exit $EXIT_CODE
 else
     exec $REAL_GCC "$@"
 fi
-EOF
+WRAPEOF
 
 cat << EOF > $HOME/compiler_hijack/g++
 #!/bin/bash
 REAL_GCC="$REAL_GXX_PATH"
 REAL_NVCC="/root/cuda_unified/bin/nvcc"
 EOF
-cat << 'EOF' >> $HOME/compiler_hijack/g++
+cat << 'WRAPEOF' >> $HOME/compiler_hijack/g++
+export PATH=/root/miniforge3/nvvm/bin:/root/miniforge3/bin:$PATH
+LOGFILE="/tmp/nvcc_progress.log"
 IS_CUDA=0
 for arg in "$@"; do
     if [[ "$arg" == *.cu.cc ]]; then
@@ -107,16 +146,51 @@ if [ $IS_CUDA -eq 1 ]; then
             -fno-*) ;;
             -fstack-protector*) ;;
             -Wall) ;;
-            -O*) CLEAN_ARGS+=("$arg") ;;
+            -O*) ;;
             *) CLEAN_ARGS+=("$arg") ;;
         esac
     done
-    CLEAN_ARGS+=("-x" "cu" "-O0" "--ptxas-options=-O0" "--compiler-options=-O0" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I$HOME/local_config_cuda_stub/cuda/cuda_include" "-I/usr/local/cuda/include")
-    exec $REAL_NVCC "${CLEAN_ARGS[@]}"
+    CLEAN_ARGS+=("-x" "cu" "-O0" "--ptxas-options=-O0" "--compiler-options=-O0" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I$HOME/local_config_cuda_stub/cuda/cuda_include" "-I/usr/local/cuda/include" "--verbose")
+
+    # Detecta o nome do arquivo .cu.cc sendo compilado
+    SRC_FILE=""
+    for a in "${CLEAN_ARGS[@]}"; do
+        [[ "$a" == *.cu.cc ]] && SRC_FILE="$a"
+    done
+    LABEL=$(basename "${SRC_FILE:-desconhecido}")
+    START_TS=$(date +%s)
+    echo "[NVCC START] $LABEL @ $(date '+%H:%M:%S')" >> "$LOGFILE"
+
+    # Executa NVCC capturando saída verbose para detectar etapas
+    $REAL_NVCC "${CLEAN_ARGS[@]}" 2>&1 | while IFS= read -r line; do
+        echo "$line" >&2
+        # Só detecta linhas de comando reais do NVCC verbose (começam com "#$ ")
+        if [[ "$line" == "#$ "* ]]; then
+            NOW=$(date +%s)
+            ELAPSED=$(( NOW - START_TS ))
+            if [[ "$line" == *"/cicc"* ]]; then
+                PCT=10; DESC="Frontend CUDA → PTX"
+            elif [[ "$line" == *"/ptxas"* ]]; then
+                PCT=60; DESC="PTX → SASS (binário GPU)"
+            elif [[ "$line" == *"/fatbinary"* ]]; then
+                PCT=90; DESC="Empacotando fatbinary"
+            elif [[ "$line" == *"/gcc"* ]] || [[ "$line" == *"/g++"* ]]; then
+                PCT=95; DESC="Host linkagem final"
+            else
+                PCT=50; DESC="Processando"
+            fi
+            echo "[NVCC ${PCT}%] $LABEL | Etapa: $DESC | ${ELAPSED}s" >> "$LOGFILE"
+        fi
+    done
+    EXIT_CODE=${PIPESTATUS[0]}
+    END_TS=$(date +%s)
+    TOTAL=$(( END_TS - START_TS ))
+    echo "[NVCC DONE] $LABEL | Total: ${TOTAL}s | Exit: $EXIT_CODE" >> "$LOGFILE"
+    exit $EXIT_CODE
 else
     exec $REAL_GCC "$@"
 fi
-EOF
+WRAPEOF
 
 chmod +x $HOME/compiler_hijack/gcc
 chmod +x $HOME/compiler_hijack/g++
