@@ -170,19 +170,24 @@ cat << EOF > $HOME/compiler_hijack/gcc
 #!/bin/bash
 # compiler_hijack/gcc: Passthrough to Conda GCC (C++17 compatible).
 # NVCC uses this via -ccbin for host compilation.
-exec "$REAL_GCC_PATH" "\$@"
+# -fPIC is always injected: fixes R_PPC64_TOC16_LO in device stubs on PPC64LE.
+exec "$REAL_GCC_PATH" -fPIC "\$@"
 EOF
 
 cat << EOF > $HOME/compiler_hijack/g++
 #!/bin/bash
 # compiler_hijack/g++: Passthrough to Conda G++ (C++17 compatible).
 # NVCC uses this via -ccbin for host compilation.
-exec "${REAL_GXX_PATH}" "\$@"
+# -fPIC is always injected: fixes R_PPC64_TOC16_LO in device stubs on PPC64LE.
+exec "${REAL_GXX_PATH}" -fPIC "\$@"
 EOF
 
 chmod +x $HOME/compiler_hijack/gcc
 chmod +x $HOME/compiler_hijack/g++
 ln -sf $HOME/compiler_hijack/g++ $HOME/compiler_hijack/c++
+# Cria symlinks para o ld do sistema no compiler_hijack (suporte a --start-lib)
+ln -sf /usr/bin/ld        $HOME/compiler_hijack/ld
+ln -sf /usr/bin/ld.bfd    $HOME/compiler_hijack/ld.bfd
 export PATH=$HOME/compiler_hijack:$PATH
 
 export CC=gcc
@@ -1890,6 +1895,16 @@ ARGS=()
 IS_CUDA=0
 REAL_NVCC="/root/cuda_unified/bin/nvcc"
 REAL_GCC="$(which powerpc64le-conda-linux-gnu-gcc 2>/dev/null || echo /usr/bin/gcc)"
+# Force host linker from system binutils (not Conda binutils).
+# Conda ld.bfd has failed on PPC64LE relocations from jpegxl in TF 2.21.
+if [ -x /usr/bin/ld ]; then
+    REAL_LD_DIR="/usr/bin"
+elif [ -x /bin/ld ]; then
+    REAL_LD_DIR="/bin"
+else
+    REAL_LD_DIR="$(dirname "$(command -v ld 2>/dev/null || echo /usr/bin/ld)")"
+fi
+GCC_FORCE_LD="-B$REAL_LD_DIR"
 
 clean_asm() {
     if [[ "$1" == *.S || "$1" == *.s ]] && [ -f "$1" ]; then
@@ -1927,7 +1942,7 @@ for arg in "$@"; do
 
     case "$arg" in
         --cuda-gpu-arch=*|--cuda-include-ptx=*|-Xcuda-fatbinary=*|-nvcc_options=*|--cuda-path=*|--offload-arch=*) ;;
-        -mno-*|-mcpu=*|-mtune=*|-mvsx|-maltivec) ;; # Strip GCC Power9 flags early
+        -mno-*|-mcpu=*|-mtune=*|-mvsx|-maltivec) ARGS+=("$arg");; # Keep for GCC, strip later for NVCC
         -mllvm) SKIP_NEXT_MLLVM=1 ;;
         -x) SKIP_NEXT=1 ;;
         *.S|*.s)
@@ -2044,7 +2059,10 @@ if [ $IS_CUDA -eq 1 ]; then
         case "$arg" in
             -Xcompiler|--compiler-options)
                 next_arg="${EXPANDED_ARGS[$i+1]}"
-                if [[ "$next_arg" == -f* ]] || [[ "$next_arg" == -W* ]]; then
+                if [[ "$next_arg" == "-fPIC" ]] || [[ "$next_arg" == "-fpic" ]]; then
+                    CLEAN_ARGS+=("--compiler-options=${next_arg}")
+                    SKIP_NEXT_ARG=1
+                elif [[ "$next_arg" == -f* ]] || [[ "$next_arg" == -W* ]]; then
                     SKIP_NEXT_ARG=1
                 else
                     CLEAN_ARGS+=("--compiler-options=${next_arg}")
@@ -2065,7 +2083,16 @@ if [ $IS_CUDA -eq 1 ]; then
             -x) 
                 SKIP_NEXT_ARG=1
                 ;;
-            -f*|-W*|-mno-*|-mfloat*|-mcpu=*|-mtune=*|-mvsx|-maltivec)
+            -fPIC|-fpic)
+                CLEAN_ARGS+=("-Xcompiler" "$arg")
+                ;;
+            -fno-visibility-inlines-hidden|-fexceptions)
+                CLEAN_ARGS+=("-Xcompiler" "$arg")
+                ;;
+            -fPIC|-fpic|-fexceptions|-fPIC)
+                CLEAN_ARGS+=("-Xcompiler" "$arg")
+                ;;
+            -f*|-W*|-mno-*|-mfloat*|-mcpu=*|-mtune=*|-mvsx|-maltivec|-mcmodel=*)
                 # Strip GCC-specific flags that NVCC doesn't understand
                 ;;
             -O*) CLEAN_ARGS+=("$arg") ;;
@@ -2084,7 +2111,9 @@ if [ $IS_CUDA -eq 1 ]; then
         esac
     done
     
-    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--expt-relaxed-constexpr" "-include" "cuda_bf16.h" "-ccbin" "/root/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "/root/miniforge3/include" "-isystem" "/root/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
+    # -fPIC: required on ppc64le when linking shared libs with lld (TOC16 relocs).
+    # Bazel passes -fPIC but this wrapper strips -f* for NVCC, so inject explicitly.
+    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "--expt-relaxed-constexpr" "-include" "cuda_bf16.h" "-ccbin" "/root/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "/root/miniforge3/include" "-isystem" "/root/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
     echo "NVCC ARGS: ${CLEAN_ARGS[@]}" >> /tmp/nvcc_dump.txt
     $REAL_NVCC "${CLEAN_ARGS[@]}"
     RC=$?
@@ -2094,7 +2123,33 @@ if [ $IS_CUDA -eq 1 ]; then
     fi
     exit $RC
 else
-    exec $REAL_GCC -mcpu=power9 "-isystem/usr/local/include/cuda_stub" "${ARGS[@]}"
+    # Pre-process params files: remove --start-lib/--end-lib before GCC calls collect2/ld
+    FINAL_ARGS=()
+    for arg in "${ARGS[@]}"; do
+        if [[ "$arg" == "-Wl,--start-lib" ]] || [[ "$arg" == "-Wl,--end-lib" ]] || [[ "$arg" == "--start-lib" ]] || [[ "$arg" == "--end-lib" ]]; then
+            continue
+        fi
+        if [[ "$arg" == @* ]]; then
+            param_file="${arg#@}"
+            if [ -f "$param_file" ]; then
+                tmp=$(mktemp /tmp/GCC_params_XXXXXX)
+                # Filter out start-lib/end-lib arguments line by line
+                grep -v -E '^[[:space:]]*(-Wl,)?--start-lib[[:space:]]*$' "$param_file" | grep -v -E '^[[:space:]]*(-Wl,)?--end-lib[[:space:]]*$' > "$tmp"
+                if ! diff -q "$param_file" "$tmp" >/dev/null 2>&1; then
+                    echo "Wrapper(GCC): Stripped flags from $param_file -> $tmp" >> /tmp/wrapper_debug.log
+                    FINAL_ARGS+=("@$tmp")
+                else
+                    rm "$tmp"
+                    FINAL_ARGS+=("$arg")
+                fi
+            else
+                FINAL_ARGS+=("$arg")
+            fi
+        else
+            FINAL_ARGS+=("$arg")
+        fi
+    done
+    exec $REAL_GCC $GCC_FORCE_LD -mcpu=power9 "-isystem/usr/local/include/cuda_stub" "${FINAL_ARGS[@]}"
 fi
 WRAPPER_EOF
 chmod +x $HOME/gcc_cuda_wrapper.sh
@@ -2109,6 +2164,16 @@ ARGS=()
 IS_CUDA=0
 REAL_NVCC="/root/cuda_unified/bin/nvcc"
 REAL_GCC="$(which powerpc64le-conda-linux-gnu-g++ 2>/dev/null || echo /usr/bin/g++)"
+# Force host linker from system binutils (not Conda binutils).
+# Conda ld.bfd has failed on PPC64LE relocations from jpegxl in TF 2.21.
+if [ -x /usr/bin/ld ]; then
+    REAL_LD_DIR="/usr/bin"
+elif [ -x /bin/ld ]; then
+    REAL_LD_DIR="/bin"
+else
+    REAL_LD_DIR="$(dirname "$(command -v ld 2>/dev/null || echo /usr/bin/ld)")"
+fi
+GCC_FORCE_LD="-B$REAL_LD_DIR"
 
 clean_asm() {
     if [[ "$1" == *.S || "$1" == *.s ]] && [ -f "$1" ]; then
@@ -2146,7 +2211,7 @@ for arg in "$@"; do
 
     case "$arg" in
         --cuda-gpu-arch=*|--cuda-include-ptx=*|-Xcuda-fatbinary=*|-nvcc_options=*|--cuda-path=*|--offload-arch=*) ;;
-        -mno-*|-mcpu=*|-mtune=*|-mvsx|-maltivec) ;; # Strip GCC Power9 flags early
+        -mno-*|-mcpu=*|-mtune=*|-mvsx|-maltivec) ARGS+=("$arg");; # Keep for GCC, strip later for NVCC
         -mllvm) SKIP_NEXT_MLLVM=1 ;;
         -x) SKIP_NEXT=1 ;;
         *.S|*.s)
@@ -2185,7 +2250,10 @@ if [ $IS_CUDA -eq 1 ]; then
         case "$arg" in
             -Xcompiler|--compiler-options)
                 next_arg="${EXPANDED_ARGS[$i+1]}"
-                if [[ "$next_arg" == -f* ]] || [[ "$next_arg" == -W* ]]; then
+                if [[ "$next_arg" == "-fPIC" ]] || [[ "$next_arg" == "-fpic" ]]; then
+                    CLEAN_ARGS+=("--compiler-options=${next_arg}")
+                    SKIP_NEXT_ARG=1
+                elif [[ "$next_arg" == -f* ]] || [[ "$next_arg" == -W* ]]; then
                     SKIP_NEXT_ARG=1
                 else
                     CLEAN_ARGS+=("--compiler-options=${next_arg}")
@@ -2206,7 +2274,16 @@ if [ $IS_CUDA -eq 1 ]; then
             -x)
                 SKIP_NEXT_ARG=1
                 ;;
-            -f*|-W*|-mno-*|-mfloat*|-mcpu=*|-mtune=*|-mvsx|-maltivec)
+            -fPIC|-fpic)
+                CLEAN_ARGS+=("-Xcompiler" "$arg")
+                ;;
+            -fno-visibility-inlines-hidden|-fexceptions)
+                CLEAN_ARGS+=("-Xcompiler" "$arg")
+                ;;
+            -fPIC|-fpic|-fexceptions|-fPIC)
+                CLEAN_ARGS+=("-Xcompiler" "$arg")
+                ;;
+            -f*|-W*|-mno-*|-mfloat*|-mcpu=*|-mtune=*|-mvsx|-maltivec|-mcmodel=*)
                 # Strip GCC-specific flags that NVCC doesn't understand
                 ;;
             -O*) CLEAN_ARGS+=("$arg") ;;
@@ -2225,7 +2302,7 @@ if [ $IS_CUDA -eq 1 ]; then
         esac
     done
     
-    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "-ccbin" "/root/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "/root/miniforge3/include" "-isystem" "/root/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
+    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "-ccbin" "/root/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "/root/miniforge3/include" "-isystem" "/root/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
     echo "NVCC ARGS: ${CLEAN_ARGS[@]}" >> /tmp/nvcc_dump.txt
     $REAL_NVCC "${CLEAN_ARGS[@]}"
     RC=$?
@@ -2235,7 +2312,33 @@ if [ $IS_CUDA -eq 1 ]; then
     fi
     exit $RC
 else
-    exec $REAL_GCC -mcpu=power9 "-isystem/usr/local/include/cuda_stub" "${ARGS[@]}"
+    # Pre-process params files: remove --start-lib/--end-lib before GCC calls collect2/ld
+    FINAL_ARGS=()
+    for arg in "${ARGS[@]}"; do
+        if [[ "$arg" == "-Wl,--start-lib" ]] || [[ "$arg" == "-Wl,--end-lib" ]] || [[ "$arg" == "--start-lib" ]] || [[ "$arg" == "--end-lib" ]]; then
+            continue
+        fi
+        if [[ "$arg" == @* ]]; then
+            param_file="${arg#@}"
+            if [ -f "$param_file" ]; then
+                tmp=$(mktemp /tmp/GXX_params_XXXXXX)
+                # Filter out start-lib/end-lib arguments line by line
+                grep -v -E '^[[:space:]]*(-Wl,)?--start-lib[[:space:]]*$' "$param_file" | grep -v -E '^[[:space:]]*(-Wl,)?--end-lib[[:space:]]*$' > "$tmp"
+                if ! diff -q "$param_file" "$tmp" >/dev/null 2>&1; then
+                    echo "Wrapper(GXX): Stripped flags from $param_file -> $tmp" >> /tmp/wrapper_debug.log
+                    FINAL_ARGS+=("@$tmp")
+                else
+                    rm "$tmp"
+                    FINAL_ARGS+=("$arg")
+                fi
+            else
+                FINAL_ARGS+=("$arg")
+            fi
+        else
+            FINAL_ARGS+=("$arg")
+        fi
+    done
+    exec $REAL_GCC $GCC_FORCE_LD -mcpu=power9 "-isystem/usr/local/include/cuda_stub" "${FINAL_ARGS[@]}"
 fi
 WRAPPER_EOF
 chmod +x $HOME/gxx_cuda_wrapper.sh
@@ -3269,20 +3372,33 @@ if [ ! -z "$CUDA_INC" ]; then
 else
     echo ">>> AVISO: Headers do CUDA toolkit não encontrados!"
 fi
-# ==============================================================================
-# Corrige o .tf_configure.bazelrc gerado
+# --- Cleanup de .tf_configure.bazelrc ---
 sed -i 's/3\.5,7\.0/7.0/g' .tf_configure.bazelrc 2>/dev/null || true
 sed -i 's/3\.5/7.0/g' .tf_configure.bazelrc 2>/dev/null || true
+sed -i '/fuse-ld=gold/d' .tf_configure.bazelrc 2>/dev/null || true
+sed -i '/use-gold-linker/d' .tf_configure.bazelrc 2>/dev/null || true
 
-# Limpa o cache de objetos CUDA já compilados em sm_35
-bazel_output_base=$(bazel info output_base 2>/dev/null || echo '/tmp')
-if [ "$bazel_output_base" != "/tmp" ]; then
-    find "$bazel_output_base" -name "*.cu.o" -delete 2>/dev/null || true
-    find "$bazel_output_base" -name "*.cu.pic.o" -delete 2>/dev/null || true
+# Escolhe linker do host com foco em PPC64LE+jpegxl:
+# - ld.gold já falhou com reloc 116/132/133
+# - ld.bfd também falhou em tentativas anteriores
+# Tentamos forçar lld; se não existir, tentamos instalar.
+if ! command -v ld.lld >/dev/null 2>&1 && [ ! -x /usr/bin/ld.lld ]; then
+    echo ">>> ld.lld não encontrado. Tentando instalar via dnf..."
+    dnf install -y lld clang-libs 2>/dev/null || dnf install -y lld 2>/dev/null || true
 fi
+
+if [ -x /usr/bin/ld.lld ] || command -v ld.lld >/dev/null 2>&1; then
+    BAZEL_FUSE_LD="lld"
+else
+    # Fallback de emergência (pode falhar com jpegxl no ppc64le).
+    BAZEL_FUSE_LD="bfd"
+    echo ">>> AVISO: ld.lld indisponível; usando fallback -fuse-ld=bfd"
+fi
+echo ">>> Linker selecionado para Bazel: -fuse-ld=${BAZEL_FUSE_LD}"
 
 bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --config=cuda \
+    --features=-start_end_lib \
     --@rules_ml_toolchain//common:enable_cuda=True \
     --repo_env=TF_NEED_CUDA=1 \
     --define=using_cuda_nvcc=true \
@@ -3300,6 +3416,8 @@ bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --host_cxxopt=-fvisibility=default \
     --copt=-DPYBIND11_EXPORT="__attribute__((visibility(\"default\")))" \
     --copt=-DPYBIND11_MODULE_LOCAL="" \
+    --linkopt=-fuse-ld=${BAZEL_FUSE_LD} \
+    --host_linkopt=-fuse-ld=${BAZEL_FUSE_LD} \
     --linkopt=-Wl,--export-dynamic \
     --linkopt=-Wl,--unresolved-symbols=ignore-all \
     --linkopt=-Wl,--allow-multiple-definition \
