@@ -48,149 +48,100 @@ cd tensorflow
 rm -f .bazelversion
 #bazel clean --expunge 2>/dev/null || true
 
-echo ">>> Criando Mutante GCC/NVCC..."
-mkdir -p $HOME/compiler_hijack
-REAL_GCC_PATH=$(which gcc)
-REAL_GXX_PATH=$(which g++)
-cat << EOF > $HOME/compiler_hijack/gcc
-#!/bin/bash
-REAL_GCC="$REAL_GCC_PATH"
-REAL_NVCC="/root/cuda_unified/bin/nvcc"
-EOF
-cat << 'WRAPEOF' >> $HOME/compiler_hijack/gcc
-export PATH=/root/miniforge3/nvvm/bin:/root/miniforge3/bin:$PATH
-LOGFILE="/tmp/nvcc_progress.log"
-IS_CUDA=0
-for arg in "$@"; do
-    if [[ "$arg" == *.cu.cc ]]; then
-        IS_CUDA=1
-        break
-    fi
-done
+# --- PATCH: Fix absl 20250814 headers for NVCC cudafe++ compatibility ---
+# O cudafe++ (parser C++ do NVCC) não suporta os templates SFINAE (IfRRef, AddPtr) do absl 20250814.
+# Solução: Wrap os macros ABSL_INTERNAL_X com #ifndef __CUDACC__ para que cudafe++ não os veja.
+# Isso é seguro pois código CUDA nunca chama insert_or_assign/try_emplace.
+echo ">>> Patching absl headers para compatibilidade NVCC cudafe++..."
 
-if [ $IS_CUDA -eq 1 ]; then
-    CLEAN_ARGS=()
-    for arg in "$@"; do
-        case "$arg" in
-            -Wno-*) ;;
-            -fno-*) ;;
-            -fstack-protector*) ;;
-            -Wall) ;;
-            -O*) ;;
-            *) CLEAN_ARGS+=("$arg") ;;
-        esac
-    done
-    CLEAN_ARGS+=("-x" "cu" "-O0" "--ptxas-options=-O0" "--compiler-options=-O0" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I$HOME/local_config_cuda_stub/cuda/cuda_include" "-I/usr/local/cuda/include" "--verbose")
+# Primeiro, fazer bazel fetch para baixar as dependências
+bazel fetch //tensorflow/tools/pip_package:wheel 2>&1 | tail -3 || true
 
-    # Detecta o nome do arquivo .cu.cc sendo compilado
-    SRC_FILE=""
-    for a in "${CLEAN_ARGS[@]}"; do
-        [[ "$a" == *.cu.cc ]] && SRC_FILE="$a"
-    done
-    LABEL=$(basename "${SRC_FILE:-desconhecido}")
-    START_TS=$(date +%s)
-    echo "[NVCC START] $LABEL @ $(date '+%H:%M:%S')" >> "$LOGFILE"
+# Encontrar e patchar os headers do absl no cache do Bazel
+BAZEL_OUTPUT_BASE=$(bazel info output_base 2>/dev/null)
+ABSL_CONTAINER_DIR="$BAZEL_OUTPUT_BASE/external/com_google_absl/absl/container/internal"
 
-    # Executa NVCC capturando saída verbose para detectar etapas
-    $REAL_NVCC "${CLEAN_ARGS[@]}" 2>&1 | while IFS= read -r line; do
-        echo "$line" >&2
-        # Só detecta linhas de comando reais do NVCC verbose (começam com "#$ ")
-        if [[ "$line" == "#$ "* ]]; then
-            NOW=$(date +%s)
-            ELAPSED=$(( NOW - START_TS ))
-            if [[ "$line" == *"/cicc"* ]]; then
-                PCT=10; DESC="Frontend CUDA → PTX"
-            elif [[ "$line" == *"/ptxas"* ]]; then
-                PCT=60; DESC="PTX → SASS (binário GPU)"
-            elif [[ "$line" == *"/fatbinary"* ]]; then
-                PCT=90; DESC="Empacotando fatbinary"
-            elif [[ "$line" == *"/gcc"* ]] || [[ "$line" == *"/g++"* ]]; then
-                PCT=95; DESC="Host linkagem final"
-            else
-                PCT=50; DESC="Processando"
-            fi
-            echo "[NVCC ${PCT}%] $LABEL | Etapa: $DESC | ${ELAPSED}s" >> "$LOGFILE"
+if [ -d "$ABSL_CONTAINER_DIR" ]; then
+    for HEADER in raw_hash_map.h btree_container.h; do
+        HFILE="$ABSL_CONTAINER_DIR/$HEADER"
+        if [ -f "$HFILE" ] && ! grep -q '__CUDACC__.*ABSL_INTERNAL_X' "$HFILE"; then
+            echo ">>> Patching $HEADER..."
+            # Wrap each ABSL_INTERNAL_X block with #ifndef __CUDACC__
+            sed -i '/^  ABSL_INTERNAL_X(insert_or_assign,/{
+                i\#ifndef __CUDACC__
+            }' "$HFILE"
+            sed -i '/^  ABSL_INTERNAL_X(try_emplace,/{
+                i\#ifndef __CUDACC__
+            }' "$HFILE"
+            # Add #endif after each closing of the macro (the line ending with );)
+            sed -i '/^  ABSL_INTERNAL_X(insert_or_assign,/,/);/{
+                /);/a\#endif  // __CUDACC__
+            }' "$HFILE"
+            sed -i '/^  ABSL_INTERNAL_X(try_emplace,/,/);/{
+                /);/a\#endif  // __CUDACC__
+            }' "$HFILE"
+            echo ">>> $HEADER patched!"
+        else
+            echo ">>> $HEADER: já patchado ou não encontrado"
         fi
     done
-    EXIT_CODE=${PIPESTATUS[0]}
-    END_TS=$(date +%s)
-    TOTAL=$(( END_TS - START_TS ))
-    echo "[NVCC DONE] $LABEL | Total: ${TOTAL}s | Exit: $EXIT_CODE" >> "$LOGFILE"
-    exit $EXIT_CODE
 else
-    exec $REAL_GCC "$@"
+    echo ">>> AVISO: Diretório absl não encontrado em $ABSL_CONTAINER_DIR"
+    echo ">>> Tentando localizar..."
+    ABSL_CONTAINER_DIR=$(find /root/.cache/bazel -path "*/external/com_google_absl/absl/container/internal" -type d 2>/dev/null | head -1)
+    if [ -n "$ABSL_CONTAINER_DIR" ]; then
+        echo ">>> Encontrado: $ABSL_CONTAINER_DIR"
+        for HEADER in raw_hash_map.h btree_container.h; do
+            HFILE="$ABSL_CONTAINER_DIR/$HEADER"
+            if [ -f "$HFILE" ] && ! grep -q '__CUDACC__.*ABSL_INTERNAL_X' "$HFILE"; then
+                echo ">>> Patching $HEADER..."
+                sed -i '/^  ABSL_INTERNAL_X(insert_or_assign,/{
+                    i\#ifndef __CUDACC__
+                }' "$HFILE"
+                sed -i '/^  ABSL_INTERNAL_X(try_emplace,/{
+                    i\#ifndef __CUDACC__
+                }' "$HFILE"
+                sed -i '/^  ABSL_INTERNAL_X(insert_or_assign,/,/);/{
+                    /);/a\#endif  // __CUDACC__
+                }' "$HFILE"
+                sed -i '/^  ABSL_INTERNAL_X(try_emplace,/,/);/{
+                    /);/a\#endif  // __CUDACC__
+                }' "$HFILE"
+                echo ">>> $HEADER patched!"
+            fi
+        done
+    fi
 fi
-WRAPEOF
+echo ">>> absl headers patched para NVCC!"
+
+echo ">>> Criando Mutante GCC/NVCC..."
+mkdir -p $HOME/compiler_hijack
+# Prefer Conda GCC (11+) over system GCC (8.5) for C++17 absl compatibility
+CONDA_GCC=$(ls /root/miniforge3/bin/powerpc64le-conda-linux-gnu-gcc 2>/dev/null)
+CONDA_GXX=$(ls /root/miniforge3/bin/powerpc64le-conda-linux-gnu-g++ 2>/dev/null)
+if [ -n "$CONDA_GCC" ] && [ -x "$CONDA_GCC" ]; then
+    REAL_GCC_PATH="$CONDA_GCC"
+    REAL_GXX_PATH="${CONDA_GXX:-$CONDA_GCC}"
+    echo ">>> Usando Conda GCC: $REAL_GCC_PATH"
+    echo ">>> Versão: $($REAL_GCC_PATH --version | head -1)"
+else
+    REAL_GCC_PATH=$(which gcc)
+    REAL_GXX_PATH=$(which g++)
+    echo ">>> AVISO: Conda GCC não encontrado, usando sistema: $REAL_GCC_PATH"
+fi
+cat << EOF > $HOME/compiler_hijack/gcc
+#!/bin/bash
+# compiler_hijack/gcc: Passthrough to Conda GCC (C++17 compatible).
+# NVCC uses this via -ccbin for host compilation.
+exec "$REAL_GCC_PATH" "\$@"
+EOF
 
 cat << EOF > $HOME/compiler_hijack/g++
 #!/bin/bash
-REAL_GCC="$REAL_GXX_PATH"
-REAL_NVCC="/root/cuda_unified/bin/nvcc"
+# compiler_hijack/g++: Passthrough to Conda G++ (C++17 compatible).
+# NVCC uses this via -ccbin for host compilation.
+exec "${REAL_GXX_PATH}" "\$@"
 EOF
-cat << 'WRAPEOF' >> $HOME/compiler_hijack/g++
-export PATH=/root/miniforge3/nvvm/bin:/root/miniforge3/bin:$PATH
-LOGFILE="/tmp/nvcc_progress.log"
-IS_CUDA=0
-for arg in "$@"; do
-    if [[ "$arg" == *.cu.cc ]]; then
-        IS_CUDA=1
-        break
-    fi
-done
-
-if [ $IS_CUDA -eq 1 ]; then
-    CLEAN_ARGS=()
-    for arg in "$@"; do
-        case "$arg" in
-            -Wno-*) ;;
-            -fno-*) ;;
-            -fstack-protector*) ;;
-            -Wall) ;;
-            -O*) ;;
-            *) CLEAN_ARGS+=("$arg") ;;
-        esac
-    done
-    CLEAN_ARGS+=("-x" "cu" "-O0" "--ptxas-options=-O0" "--compiler-options=-O0" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I$HOME/local_config_cuda_stub/cuda/cuda_include" "-I/usr/local/cuda/include" "--verbose")
-
-    # Detecta o nome do arquivo .cu.cc sendo compilado
-    SRC_FILE=""
-    for a in "${CLEAN_ARGS[@]}"; do
-        [[ "$a" == *.cu.cc ]] && SRC_FILE="$a"
-    done
-    LABEL=$(basename "${SRC_FILE:-desconhecido}")
-    START_TS=$(date +%s)
-    echo "[NVCC START] $LABEL @ $(date '+%H:%M:%S')" >> "$LOGFILE"
-
-    # Executa NVCC capturando saída verbose para detectar etapas
-    $REAL_NVCC "${CLEAN_ARGS[@]}" 2>&1 | while IFS= read -r line; do
-        echo "$line" >&2
-        # Só detecta linhas de comando reais do NVCC verbose (começam com "#$ ")
-        if [[ "$line" == "#$ "* ]]; then
-            NOW=$(date +%s)
-            ELAPSED=$(( NOW - START_TS ))
-            if [[ "$line" == *"/cicc"* ]]; then
-                PCT=10; DESC="Frontend CUDA → PTX"
-            elif [[ "$line" == *"/ptxas"* ]]; then
-                PCT=60; DESC="PTX → SASS (binário GPU)"
-            elif [[ "$line" == *"/fatbinary"* ]]; then
-                PCT=90; DESC="Empacotando fatbinary"
-            elif [[ "$line" == *"/gcc"* ]] || [[ "$line" == *"/g++"* ]]; then
-                PCT=95; DESC="Host linkagem final"
-            else
-                PCT=50; DESC="Processando"
-            fi
-            echo "[NVCC ${PCT}%] $LABEL | Etapa: $DESC | ${ELAPSED}s" >> "$LOGFILE"
-        fi
-    done
-    EXIT_CODE=${PIPESTATUS[0]}
-    END_TS=$(date +%s)
-    TOTAL=$(( END_TS - START_TS ))
-    echo "[NVCC DONE] $LABEL | Total: ${TOTAL}s | Exit: $EXIT_CODE" >> "$LOGFILE"
-    exit $EXIT_CODE
-else
-    exec $REAL_GCC "$@"
-fi
-WRAPEOF
 
 chmod +x $HOME/compiler_hijack/gcc
 chmod +x $HOME/compiler_hijack/g++
@@ -199,8 +150,8 @@ export PATH=$HOME/compiler_hijack:$PATH
 
 export CC=gcc
 export CXX=g++
-export CFLAGS="-mno-float128 -O3"
-export CXXFLAGS="-mno-float128 -O3"
+export CFLAGS="-O3"
+export CXXFLAGS="-O3"
 export TF_NEED_CLANG=0
 export TF_DOWNLOAD_CLANG=0
 export TF_NEED_CUDA=1
@@ -214,7 +165,7 @@ export PYTHON_LIB_PATH=$(python3 -c 'import site; print(site.getsitepackages()[0
 export TF_CONFIGURE_IOS=0
 export TF_CUDA_CLANG=0
 export TF_CUDA_COMPUTE_CAPABILITIES="7.0"
-export CC_OPT_FLAGS="-mno-float128"
+export CC_OPT_FLAGS=""
 export GCC_HOST_COMPILER_PATH=$(which gcc)
 
 yes "" | ./configure || true
@@ -227,6 +178,8 @@ if [ -f .tf_configure.bazelrc ]; then
     # Remove linhas problemáticas (com ou sem aspas)
     sed -i '/cuda_clang/d' .tf_configure.bazelrc
     sed -i '/fuse-ld/d' .tf_configure.bazelrc
+    # Remove -mno-float128 do --copt (NVCC não entende essa flag GCC do Power9)
+    sed -i '/mno-float128/d' .tf_configure.bazelrc
     # Remove qualquer --config=cuda existente para evitar duplicação
     sed -i '/--config=cuda$/d' .tf_configure.bazelrc
     # Adiciona --config=cuda limpo (uma única vez)
@@ -1838,6 +1791,8 @@ cat > $HOME/gcc_cuda_wrapper.sh << 'WRAPPER_EOF'
 #!/bin/bash
 unset NVCC_APPEND_FLAGS
 unset NVCC_PREPEND_FLAGS
+# CRITICAL: Ensure cicc and ptxas are in PATH for NVCC
+export PATH=/root/miniforge3/nvvm/bin:/root/miniforge3/bin:/root/cuda_unified/bin:$PATH
 ARGS=()
 IS_CUDA=0
 REAL_NVCC="/root/cuda_unified/bin/nvcc"
@@ -1879,6 +1834,7 @@ for arg in "$@"; do
 
     case "$arg" in
         --cuda-gpu-arch=*|--cuda-include-ptx=*|-Xcuda-fatbinary=*|-nvcc_options=*|--cuda-path=*|--offload-arch=*) ;;
+        -mno-*|-mcpu=*|-mtune=*|-mvsx|-maltivec) ;; # Strip GCC Power9 flags early
         -mllvm) SKIP_NEXT_MLLVM=1 ;;
         -x) SKIP_NEXT=1 ;;
         *.S|*.s)
@@ -1916,7 +1872,7 @@ if [ $IS_CUDA -eq 1 ]; then
         
         case "$arg" in
             -Xcompiler|--compiler-options)
-                local next_arg="${EXPANDED_ARGS[$i+1]}"
+                next_arg="${EXPANDED_ARGS[$i+1]}"
                 if [[ "$next_arg" == -f* ]] || [[ "$next_arg" == -W* ]]; then
                     SKIP_NEXT_ARG=1
                 else
@@ -1929,11 +1885,17 @@ if [ $IS_CUDA -eq 1 ]; then
                 SKIP_NEXT_ARG=1
                 ;;
             -Wno-*|-fno-*|-fstack-protector*|-Wall|-Werror*|-Wunused*|-Wformat*|-g0|-ffunction-sections|-fdata-sections|-fvisibility=*|-frandom-seed=*) ;;
+            -D_FORTIFY_SOURCE*|-U_FORTIFY_SOURCE) ;; # Incompatible with -O0
+            -MF)
+                DEP_FILE="${EXPANDED_ARGS[$i+1]}"
+                CLEAN_ARGS+=("-MF" "$DEP_FILE")
+                SKIP_NEXT_ARG=1
+                ;;
             -x) 
                 SKIP_NEXT_ARG=1
                 ;;
-            -f*|-W*)
-                # Strip all -f and -W flags completely
+            -f*|-W*|-mno-*|-mfloat*|-mcpu=*|-mtune=*|-mvsx|-maltivec)
+                # Strip GCC-specific flags that NVCC doesn't understand
                 ;;
             -O*) CLEAN_ARGS+=("$arg") ;;
             -iquote)
@@ -1951,9 +1913,15 @@ if [ $IS_CUDA -eq 1 ]; then
         esac
     done
     
-    CLEAN_ARGS+=("-x" "cu" "-O0" "--ptxas-options=-O0" "--compiler-options=-O0" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I/usr/local/include/cuda_stub" "-I/usr/local/cuda/include" "--forward-unknown-to-host-compiler")
+    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "-ccbin" "/root/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "/root/miniforge3/include" "-isystem" "/root/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
     echo "NVCC ARGS: ${CLEAN_ARGS[@]}" >> /tmp/nvcc_dump.txt
-    exec $REAL_NVCC "${CLEAN_ARGS[@]}"
+    $REAL_NVCC "${CLEAN_ARGS[@]}"
+    RC=$?
+    # Post-process .d file: remove absolute path dependencies that Bazel rejects
+    if [ -n "$DEP_FILE" ] && [ -f "$DEP_FILE" ]; then
+        sed -i 's| /[^ ]*||g' "$DEP_FILE"
+    fi
+    exit $RC
 else
     exec $REAL_GCC "-isystem/usr/local/include/cuda_stub" "${ARGS[@]}"
 fi
@@ -1964,6 +1932,8 @@ cat > $HOME/gxx_cuda_wrapper.sh << 'WRAPPER_EOF'
 #!/bin/bash
 unset NVCC_APPEND_FLAGS
 unset NVCC_PREPEND_FLAGS
+# CRITICAL: Ensure cicc and ptxas are in PATH for NVCC
+export PATH=/root/miniforge3/nvvm/bin:/root/miniforge3/bin:/root/cuda_unified/bin:$PATH
 ARGS=()
 IS_CUDA=0
 REAL_NVCC="/root/cuda_unified/bin/nvcc"
@@ -2005,6 +1975,7 @@ for arg in "$@"; do
 
     case "$arg" in
         --cuda-gpu-arch=*|--cuda-include-ptx=*|-Xcuda-fatbinary=*|-nvcc_options=*|--cuda-path=*|--offload-arch=*) ;;
+        -mno-*|-mcpu=*|-mtune=*|-mvsx|-maltivec) ;; # Strip GCC Power9 flags early
         -mllvm) SKIP_NEXT_MLLVM=1 ;;
         -x) SKIP_NEXT=1 ;;
         *.S|*.s)
@@ -2042,7 +2013,7 @@ if [ $IS_CUDA -eq 1 ]; then
         
         case "$arg" in
             -Xcompiler|--compiler-options)
-                local next_arg="${EXPANDED_ARGS[$i+1]}"
+                next_arg="${EXPANDED_ARGS[$i+1]}"
                 if [[ "$next_arg" == -f* ]] || [[ "$next_arg" == -W* ]]; then
                     SKIP_NEXT_ARG=1
                 else
@@ -2055,11 +2026,17 @@ if [ $IS_CUDA -eq 1 ]; then
                 SKIP_NEXT_ARG=1
                 ;;
             -Wno-*|-fno-*|-fstack-protector*|-Wall|-Werror*|-Wunused*|-Wformat*|-g0|-ffunction-sections|-fdata-sections|-fvisibility=*|-frandom-seed=*) ;;
+            -D_FORTIFY_SOURCE*|-U_FORTIFY_SOURCE) ;; # Incompatible with -O0
+            -MF)
+                DEP_FILE="${EXPANDED_ARGS[$i+1]}"
+                CLEAN_ARGS+=("-MF" "$DEP_FILE")
+                SKIP_NEXT_ARG=1
+                ;;
             -x)
                 SKIP_NEXT_ARG=1
                 ;;
-            -f*|-W*)
-                # Strip all -f and -W flags completely
+            -f*|-W*|-mno-*|-mfloat*|-mcpu=*|-mtune=*|-mvsx|-maltivec)
+                # Strip GCC-specific flags that NVCC doesn't understand
                 ;;
             -O*) CLEAN_ARGS+=("$arg") ;;
             -iquote)
@@ -2077,9 +2054,15 @@ if [ $IS_CUDA -eq 1 ]; then
         esac
     done
     
-    CLEAN_ARGS+=("-x" "cu" "-O0" "--ptxas-options=-O0" "--compiler-options=-O0" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-I/usr/local/include/cuda_stub" "-I/usr/local/cuda/include" "--forward-unknown-to-host-compiler")
+    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "-ccbin" "/root/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "/root/miniforge3/include" "-isystem" "/root/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
     echo "NVCC ARGS: ${CLEAN_ARGS[@]}" >> /tmp/nvcc_dump.txt
-    exec $REAL_NVCC "${CLEAN_ARGS[@]}"
+    $REAL_NVCC "${CLEAN_ARGS[@]}"
+    RC=$?
+    # Post-process .d file: remove absolute path dependencies that Bazel rejects
+    if [ -n "$DEP_FILE" ] && [ -f "$DEP_FILE" ]; then
+        sed -i 's| /[^ ]*||g' "$DEP_FILE"
+    fi
+    exit $RC
 else
     exec $REAL_GCC "-isystem/usr/local/include/cuda_stub" "${ARGS[@]}"
 fi
@@ -3228,12 +3211,12 @@ bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --discard_analysis_cache \
     --nokeep_state_after_build \
     --notrack_incremental_state \
-    --local_resources=cpu=4 \
+    --local_resources=cpu=16 \
     --strategy=CudaCompile=local \
     --per_file_copt=".*\.cu\.cc@--maxrregcount=64" \
     --repo_env=TF_CUDA_COMPUTE_CAPABILITIES=7.0 \
     --define=TF_CUDA_COMPUTE_CAPABILITIES=7.0 \
-    --jobs=4 \
+    --jobs=16 \
     //tensorflow/tools/pip_package:wheel
 
 # Localizar o .whl gerado
