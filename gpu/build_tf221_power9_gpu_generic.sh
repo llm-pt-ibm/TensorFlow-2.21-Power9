@@ -48,69 +48,106 @@ cd tensorflow
 rm -f .bazelversion
 #bazel clean --expunge 2>/dev/null || true
 
-# --- PATCH: Fix absl 20250814 headers for NVCC cudafe++ compatibility ---
-# O cudafe++ (parser C++ do NVCC) não suporta os templates SFINAE (IfRRef, AddPtr) do absl 20250814.
-# Solução: Wrap os macros ABSL_INTERNAL_X com #ifndef __CUDACC__ para que cudafe++ não os veja.
-# Isso é seguro pois código CUDA nunca chama insert_or_assign/try_emplace.
+# --- PATCH: Fix absl headers for NVCC cudafe++ compatibility ---
+# The NVCC cudafe++ parser can't handle the complex SFINAE templates used by
+# absl's insert_or_assign/try_emplace methods. This patch has TWO layers:
+#   1) Internal headers (raw_hash_map.h, btree_container.h): guard the
+#      ABSL_INTERNAL_X macro expansions with #ifndef __CUDACC__
+#   2) Public headers (btree_map.h, flat_hash_map.h): guard the
+#      "using Base::insert_or_assign" and "using Base::try_emplace"
+#      declarations, which would fail if the base class members are hidden.
+# This is safe because CUDA device code never calls insert_or_assign/try_emplace.
 echo ">>> Patching absl headers para compatibilidade NVCC cudafe++..."
 
-# Primeiro, fazer bazel fetch para baixar as dependências
+# First, do bazel fetch to download dependencies
 bazel fetch //tensorflow/tools/pip_package:wheel 2>&1 | tail -3 || true
 
-# Encontrar e patchar os headers do absl no cache do Bazel
+# Find the absl container directory in bazel cache
 BAZEL_OUTPUT_BASE=$(bazel info output_base 2>/dev/null)
-ABSL_CONTAINER_DIR="$BAZEL_OUTPUT_BASE/external/com_google_absl/absl/container/internal"
+ABSL_CONTAINER_DIR="$BAZEL_OUTPUT_BASE/external/com_google_absl/absl/container"
+
+# Fallback: search in bazel cache if not at expected path
+if [ ! -d "$ABSL_CONTAINER_DIR" ]; then
+    echo ">>> AVISO: absl not found at expected path, searching..."
+    ABSL_CONTAINER_DIR=$(find /root/.cache/bazel -path "*/external/com_google_absl/absl/container" -type d ! -path "*/internal/*" 2>/dev/null | head -1)
+fi
 
 if [ -d "$ABSL_CONTAINER_DIR" ]; then
-    for HEADER in raw_hash_map.h btree_container.h; do
-        HFILE="$ABSL_CONTAINER_DIR/$HEADER"
-        if [ -f "$HFILE" ] && ! grep -q '__CUDACC__.*ABSL_INTERNAL_X' "$HFILE"; then
-            echo ">>> Patching $HEADER..."
-            # Wrap each ABSL_INTERNAL_X block with #ifndef __CUDACC__
-            sed -i '/^  ABSL_INTERNAL_X(insert_or_assign,/{
-                i\#ifndef __CUDACC__
-            }' "$HFILE"
-            sed -i '/^  ABSL_INTERNAL_X(try_emplace,/{
-                i\#ifndef __CUDACC__
-            }' "$HFILE"
-            # Add #endif after each closing of the macro (the line ending with );)
-            sed -i '/^  ABSL_INTERNAL_X(insert_or_assign,/,/);/{
-                /);/a\#endif  // __CUDACC__
-            }' "$HFILE"
-            sed -i '/^  ABSL_INTERNAL_X(try_emplace,/,/);/{
-                /);/a\#endif  // __CUDACC__
-            }' "$HFILE"
-            echo ">>> $HEADER patched!"
-        else
-            echo ">>> $HEADER: já patchado ou não encontrado"
-        fi
-    done
+    echo ">>> absl container dir: $ABSL_CONTAINER_DIR"
+
+    # Use a Python script for robust multi-file patching
+    python3 - "$ABSL_CONTAINER_DIR" << 'ABSL_PATCH_EOF'
+import sys, os, re
+
+container_dir = sys.argv[1]
+
+def patch_internal_header(filepath):
+    """Guard ABSL_INTERNAL_X(insert_or_assign,...) and ABSL_INTERNAL_X(try_emplace,...) with #ifndef __CUDACC__"""
+    if not os.path.isfile(filepath):
+        print(f"  SKIP (not found): {filepath}")
+        return
+    with open(filepath, 'r') as f:
+        content = f.read()
+    if '__CUDACC__' in content:
+        print(f"  SKIP (already patched): {os.path.basename(filepath)}")
+        return
+
+    for method in ['insert_or_assign', 'try_emplace']:
+        # Pattern: "  ABSL_INTERNAL_X(method_name," ... closing ");"
+        # We wrap the entire macro invocation block with #ifndef __CUDACC__ / #endif
+        pattern = re.compile(
+            r'(^[ \t]*ABSL_INTERNAL_X\(' + method + r',.*?\);)',
+            re.MULTILINE | re.DOTALL
+        )
+        content = pattern.sub(
+            r'#ifndef __CUDACC__\n\1\n#endif  // __CUDACC__',
+            content
+        )
+    with open(filepath, 'w') as f:
+        f.write(content)
+    print(f"  PATCHED: {os.path.basename(filepath)}")
+
+def patch_public_header(filepath):
+    """Guard 'using Base::insert_or_assign' and 'using Base::try_emplace' with #ifndef __CUDACC__"""
+    if not os.path.isfile(filepath):
+        print(f"  SKIP (not found): {filepath}")
+        return
+    with open(filepath, 'r') as f:
+        content = f.read()
+    if '#ifndef __CUDACC__' in content and 'insert_or_assign' in content:
+        print(f"  SKIP (already patched): {os.path.basename(filepath)}")
+        return
+
+    for method in ['insert_or_assign', 'try_emplace']:
+        # Pattern: "  using Base::method_name;" (with possible whitespace variations)
+        pattern = re.compile(
+            r'^([ \t]*using Base::' + method + r'\s*;)',
+            re.MULTILINE
+        )
+        content = pattern.sub(
+            r'#ifndef __CUDACC__\n\1\n#endif  // __CUDACC__',
+            content
+        )
+    with open(filepath, 'w') as f:
+        f.write(content)
+    print(f"  PATCHED: {os.path.basename(filepath)}")
+
+# Layer 1: Internal headers (ABSL_INTERNAL_X macro definitions)
+print(">>> Layer 1: Patching internal absl headers (ABSL_INTERNAL_X macros)...")
+internal_dir = os.path.join(container_dir, "internal")
+for header in ["raw_hash_map.h", "btree_container.h"]:
+    patch_internal_header(os.path.join(internal_dir, header))
+
+# Layer 2: Public headers (using Base::... declarations)
+print(">>> Layer 2: Patching public absl headers (using Base:: declarations)...")
+for header in ["btree_map.h", "flat_hash_map.h"]:
+    patch_public_header(os.path.join(container_dir, header))
+
+print(">>> All absl NVCC patches applied successfully!")
+ABSL_PATCH_EOF
 else
-    echo ">>> AVISO: Diretório absl não encontrado em $ABSL_CONTAINER_DIR"
-    echo ">>> Tentando localizar..."
-    ABSL_CONTAINER_DIR=$(find /root/.cache/bazel -path "*/external/com_google_absl/absl/container/internal" -type d 2>/dev/null | head -1)
-    if [ -n "$ABSL_CONTAINER_DIR" ]; then
-        echo ">>> Encontrado: $ABSL_CONTAINER_DIR"
-        for HEADER in raw_hash_map.h btree_container.h; do
-            HFILE="$ABSL_CONTAINER_DIR/$HEADER"
-            if [ -f "$HFILE" ] && ! grep -q '__CUDACC__.*ABSL_INTERNAL_X' "$HFILE"; then
-                echo ">>> Patching $HEADER..."
-                sed -i '/^  ABSL_INTERNAL_X(insert_or_assign,/{
-                    i\#ifndef __CUDACC__
-                }' "$HFILE"
-                sed -i '/^  ABSL_INTERNAL_X(try_emplace,/{
-                    i\#ifndef __CUDACC__
-                }' "$HFILE"
-                sed -i '/^  ABSL_INTERNAL_X(insert_or_assign,/,/);/{
-                    /);/a\#endif  // __CUDACC__
-                }' "$HFILE"
-                sed -i '/^  ABSL_INTERNAL_X(try_emplace,/,/);/{
-                    /);/a\#endif  // __CUDACC__
-                }' "$HFILE"
-                echo ">>> $HEADER patched!"
-            fi
-        done
-    fi
+    echo ">>> ERRO: Could not find absl container directory anywhere in bazel cache!"
+    echo ">>> The build may fail with insert_or_assign/try_emplace errors in CUDA files."
 fi
 echo ">>> absl headers patched para NVCC!"
 
@@ -571,7 +608,7 @@ if [ ! -d $HOME/local_config_cuda_stub/cuda/cuda_include ]; then mkdir -p $HOME/
 # Bate a real: O Conda fragmenta os pacotes cuda-cudart, cuda-nvcc, etc em diretorios "pkgs" ultra-isolados.
 # Localizamos arquivos chave de cada pacote e aglutinamos tudo na raiz do stub.
 echo ">>> Buscando os blocos isolados do CUDA pelo sistema..."
-for CRIT_HEADER in "cuda_runtime_api.h" "vector_functions.h" "math_functions.h" "cuda_fp16.h" "driver_types.h"; do
+for CRIT_HEADER in "cuda_runtime_api.h" "vector_functions.h" "math_functions.h" "cuda_fp16.h" "cuda_bf16.h" "driver_types.h"; do
     CRIT_PATH=$(find /usr /opt /root $CONDA_PREFIX -name "$CRIT_HEADER" 2>/dev/null | head -n 1)
     if [ ! -z "$CRIT_PATH" ]; then
         CRIT_DIR=$(dirname "$CRIT_PATH")
@@ -1492,6 +1529,62 @@ PYEOF
 mkdir -p /usr/local/include/cuda_stub
 rm -rf /usr/local/include/cuda_stub/*
 cp -rL $HOME/local_config_cuda_stub/cuda/cuda_include/* /usr/local/include/cuda_stub/
+# --- Fallback: ensure cuda_bf16.h exists (older CUDA on ppc64le may lack it) ---
+if [ ! -f /usr/local/include/cuda_stub/cuda_bf16.h ]; then
+    echo ">>> cuda_bf16.h não encontrado — criando stub mínimo para __nv_bfloat16..."
+    cat > /usr/local/include/cuda_stub/cuda_bf16.h << 'BF16_STUB'
+/* ppc64le stub: minimal __nv_bfloat16 definition for CUDA compilation */
+#ifndef __CUDA_BF16_H__
+#define __CUDA_BF16_H__
+
+#ifndef __CUDA_ALIGN__
+#if defined(__CUDACC__)
+#define __CUDA_ALIGN__(n) __align__(n)
+#else
+#define __CUDA_ALIGN__(n) alignas(n)
+#endif
+#endif
+
+#ifndef __CUDA_HOSTDEVICE_FP16_DECL__
+#if defined(__CUDACC__)
+#define __CUDA_HOSTDEVICE_FP16_DECL__ static __device__ __host__ __forceinline__
+#else
+#define __CUDA_HOSTDEVICE_FP16_DECL__ static inline
+#endif
+#endif
+
+typedef struct __CUDA_ALIGN__(2) {
+    unsigned short x;
+} __nv_bfloat16;
+
+typedef struct __CUDA_ALIGN__(4) {
+    unsigned int x;
+} __nv_bfloat162;
+
+/* Basic conversions needed by XLA buffer comparator */
+__CUDA_HOSTDEVICE_FP16_DECL__ __nv_bfloat16 __float2bfloat16(const float f) {
+    __nv_bfloat16 val;
+    unsigned int u;
+    __builtin_memcpy(&u, &f, sizeof(u));
+    /* Round to nearest even */
+    unsigned int lsb = (u >> 16) & 1;
+    unsigned int rounding_bias = 0x7fffU + lsb;
+    u += rounding_bias;
+    val.x = (unsigned short)(u >> 16);
+    return val;
+}
+
+__CUDA_HOSTDEVICE_FP16_DECL__ float __bfloat162float(const __nv_bfloat16 h) {
+    float f;
+    unsigned int u = ((unsigned int)h.x) << 16;
+    __builtin_memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+#endif /* __CUDA_BF16_H__ */
+BF16_STUB
+    echo ">>> cuda_bf16.h stub criado."
+fi
 # --- libcudacxx (cuda/atomic etc.) ---
 CUDA_ATOMIC_SRC=$(find /usr /usr/local /opt $CONDA_PREFIX -path "*/include/cuda/atomic" 2>/dev/null | head -n 1)
 if [ -n "$CUDA_ATOMIC_SRC" ]; then
@@ -1913,7 +2006,7 @@ if [ $IS_CUDA -eq 1 ]; then
         esac
     done
     
-    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "-ccbin" "/root/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "/root/miniforge3/include" "-isystem" "/root/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
+    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--expt-relaxed-constexpr" "-include" "cuda_bf16.h" "-ccbin" "/root/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "/root/miniforge3/include" "-isystem" "/root/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
     echo "NVCC ARGS: ${CLEAN_ARGS[@]}" >> /tmp/nvcc_dump.txt
     $REAL_NVCC "${CLEAN_ARGS[@]}"
     RC=$?
