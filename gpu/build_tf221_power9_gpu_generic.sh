@@ -1977,7 +1977,7 @@ if [ $IS_CUDA -eq 1 ]; then
                 CLEAN_ARGS+=("-Xlinker=${EXPANDED_ARGS[$i+1]}")
                 SKIP_NEXT_ARG=1
                 ;;
-            -Wno-*|-fno-*|-fstack-protector*|-Wall|-Werror*|-Wunused*|-Wformat*|-g0|-ffunction-sections|-fdata-sections|-fvisibility=*|-frandom-seed=*) ;;
+            -Wno-*|-fno-*|-fstack-protector*|-Wall|-Werror*|-Wunused*|-Wformat*|-g0|-ffunction-sections|-fdata-sections|-fvisibility=*|-frandom-seed=*|-pthread) ;;
             -D_FORTIFY_SOURCE*|-U_FORTIFY_SOURCE) ;; # Incompatible with -O0
             -MF)
                 DEP_FILE="${EXPANDED_ARGS[$i+1]}"
@@ -3224,7 +3224,11 @@ bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --copt=-DPYBIND11_MODULE_LOCAL="" \
     --linkopt=-Wl,--export-dynamic \
     --linkopt=-Wl,--unresolved-symbols=ignore-all \
+    --linkopt=-Wl,--allow-multiple-definition \
     --linkopt=-Wl,--allow-shlib-undefined \
+    --host_linkopt=-Wl,--allow-multiple-definition \
+    --host_linkopt=-Wl,--unresolved-symbols=ignore-all \
+    --host_linkopt=-Wl,--allow-shlib-undefined \
     --extra_toolchains=@@local_config_python//:py_cc_toolchain \
     --override_repository=rules_ml_toolchain=$HOME/rules_ml_toolchain_patched \
     --override_repository=llvm_linux_x86_64=$HOME/llvm_stub \
