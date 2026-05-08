@@ -2094,7 +2094,7 @@ if [ $IS_CUDA -eq 1 ]; then
     fi
     exit $RC
 else
-    exec $REAL_GCC "-isystem/usr/local/include/cuda_stub" "${ARGS[@]}"
+    exec $REAL_GCC -mcpu=power9 "-isystem/usr/local/include/cuda_stub" "${ARGS[@]}"
 fi
 WRAPPER_EOF
 chmod +x $HOME/gcc_cuda_wrapper.sh
@@ -2235,7 +2235,7 @@ if [ $IS_CUDA -eq 1 ]; then
     fi
     exit $RC
 else
-    exec $REAL_GCC "-isystem/usr/local/include/cuda_stub" "${ARGS[@]}"
+    exec $REAL_GCC -mcpu=power9 "-isystem/usr/local/include/cuda_stub" "${ARGS[@]}"
 fi
 WRAPPER_EOF
 chmod +x $HOME/gxx_cuda_wrapper.sh
