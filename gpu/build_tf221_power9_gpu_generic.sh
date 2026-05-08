@@ -1938,6 +1938,84 @@ for arg in "$@"; do
     esac
 done
 
+# Detect exec-configuration builds (host tools / genrules).
+# Bazel places exec-config outputs in paths like bazel-out/ppc-opt-exec-ST-xxx/.
+# These tools must actually RUN on the build host, so they must NOT contain
+# real CUDA kernel launches (which require a working CUDA runtime).
+# Force GCC compilation for .cu.cc in exec config — the #ifdef __CUDACC__ guards
+# will strip GPU kernel code, producing a tool that links and runs correctly.
+IS_EXEC=0
+for arg in "$@"; do
+    if [[ "$arg" == *"-exec-"* ]]; then
+        IS_EXEC=1
+        break
+    fi
+    if [[ "$arg" == @* ]]; then
+        pf="${arg#@}"
+        if [ -f "$pf" ] && grep -q "\-exec-" "$pf" 2>/dev/null; then
+            IS_EXEC=1
+            break
+        fi
+    fi
+done
+if [ $IS_EXEC -eq 1 ] && [ $IS_CUDA -eq 1 ]; then
+    # Exec-config .cu.cc: produce an empty object file.
+    # GCC cannot compile these files because they depend on CUDA-only headers
+    # (CUB, Thrust, etc.) that aren't available outside NVCC.
+    # Exec tools don't need GPU kernels — they just need to link and run.
+    OUT_FILE=""
+    for i in "${!ARGS[@]}"; do
+        if [[ "${ARGS[$i]}" == "-o" ]]; then
+            OUT_FILE="${ARGS[$i+1]}"
+            break
+        fi
+    done
+    # Also check param files for -o
+    if [ -z "$OUT_FILE" ]; then
+        for arg in "$@"; do
+            if [[ "$arg" == @* ]]; then
+                pf="${arg#@}"
+                if [ -f "$pf" ]; then
+                    OUT_FILE=$(grep -A1 '^-o$' "$pf" 2>/dev/null | tail -1 | tr -d "'" | tr -d '"')
+                    [ -n "$OUT_FILE" ] && break
+                fi
+            fi
+        done
+    fi
+    if [ -n "$OUT_FILE" ]; then
+        mkdir -p "$(dirname "$OUT_FILE")"
+        echo "// empty exec-config .cu.cc stub" | $REAL_GCC -x c++ -c - -o "$OUT_FILE"
+        # Also create the .d dependency file Bazel expects
+        DEP_FILE=""
+        for i in "${!ARGS[@]}"; do
+            if [[ "${ARGS[$i]}" == "-MF" ]]; then
+                DEP_FILE="${ARGS[$i+1]}"
+                break
+            fi
+        done
+        if [ -z "$DEP_FILE" ]; then
+            for arg in "$@"; do
+                if [[ "$arg" == @* ]]; then
+                    pf="${arg#@}"
+                    if [ -f "$pf" ]; then
+                        DEP_FILE=$(grep -A1 '^-MF$' "$pf" 2>/dev/null | tail -1 | tr -d "'" | tr -d '"')
+                        [ -n "$DEP_FILE" ] && break
+                    fi
+                fi
+            done
+        fi
+        # Fallback: derive .d path from .o path
+        if [ -z "$DEP_FILE" ]; then
+            DEP_FILE="${OUT_FILE%.o}.d"
+        fi
+        mkdir -p "$(dirname "$DEP_FILE")"
+        echo "$OUT_FILE:" > "$DEP_FILE"
+        exit $?
+    fi
+    # Fallback: let GCC try (will likely fail, but better than silently doing nothing)
+    IS_CUDA=0
+fi
+
 if [ $IS_CUDA -eq 1 ]; then
     EXPANDED_ARGS=()
     for arg in "${ARGS[@]}"; do
@@ -3227,7 +3305,6 @@ bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --linkopt=-Wl,--allow-multiple-definition \
     --linkopt=-Wl,--allow-shlib-undefined \
     --host_linkopt=-Wl,--allow-multiple-definition \
-    --host_linkopt=-Wl,--unresolved-symbols=ignore-all \
     --host_linkopt=-Wl,--allow-shlib-undefined \
     --extra_toolchains=@@local_config_python//:py_cc_toolchain \
     --override_repository=rules_ml_toolchain=$HOME/rules_ml_toolchain_patched \
