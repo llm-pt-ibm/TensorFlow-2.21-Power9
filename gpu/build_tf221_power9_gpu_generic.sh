@@ -3738,6 +3738,94 @@ ln -sf $CONDA_PREFIX/lib/libcudnn_adv_train.so.8 $HOME/cuda_unified/lib64/libcud
 # Usa o libstdc++ do Conda que é mais novo.
 export LD_LIBRARY_PATH=$HOME/cuda_unified/lib64:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}
 
+# ==============================================================================
+# STUBS para símbolos _mlir_ciface_* não-definidos
+# ==============================================================================
+# O build linkou libtensorflow_cc.so.2 com --unresolved-symbols=ignore-all,
+# então a .so saiu com símbolos não-definidos (kernels MLIR codegen que não
+# foram empacotados corretamente nesta build PPC64LE). No `import tensorflow`,
+# o dlopen falha no primeiro símbolo faltando.
+# Solução: gerar uma .so com stubs vazios pra cada símbolo `_mlir_ciface_*`
+# faltante e fazer libtensorflow_cc.so.2 depender dela (DT_NEEDED via patchelf).
+# Caveats: ops que usariam esses kernels MLIR gerados (alguns Casts em GPU,
+# certos unary ops em tipos esquisitos) vão chamar stubs vazios e abortar com
+# mensagem clara. O resto do TF (kernels nativos, cuDNN, cuBLAS, etc) funciona.
+echo ""
+echo ">>> Gerando stubs para símbolos _mlir_ciface_* não-definidos..."
+
+TF_DIR="$CONDA_PREFIX/lib/python$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')/site-packages/tensorflow"
+TF_LIB="$TF_DIR/libtensorflow_cc.so.2"
+
+if [ ! -f "$TF_LIB" ]; then
+    echo ">>> AVISO: $TF_LIB não encontrado; pulando geração de stubs"
+else
+    nm -D --undefined-only "$TF_LIB" 2>/dev/null | awk '{print $NF}' | grep '^_mlir_ciface_' | sort -u > /tmp/missing_mlir.txt
+    MISSING_COUNT=$(wc -l < /tmp/missing_mlir.txt)
+    echo ">>> Encontrados $MISSING_COUNT símbolos _mlir_ciface_* não-definidos"
+
+    if [ "$MISSING_COUNT" -gt 0 ]; then
+        # Gera stubs.cc: cada símbolo é uma função void(...) que aborta.
+        # C linkage não checa aridade, então qualquer chamada cai no stub
+        # independente dos argumentos.
+        {
+            echo '// Auto-gerado: stubs para símbolos _mlir_ciface_* não compilados na build PPC64LE'
+            echo '#include <stdio.h>'
+            echo '#include <stdlib.h>'
+            echo
+            echo 'static void _mlir_stub_abort(const char* sym) {'
+            echo '    fprintf(stderr,'
+            echo '            "\\n*** TF PPC64LE stub: chamado MLIR ciface não-compilado: %s ***\\n"'
+            echo '            "Este kernel não foi gerado nesta build. Use um tipo/op alternativo.\\n",'
+            echo '            sym);'
+            echo '    abort();'
+            echo '}'
+            echo
+            echo 'extern "C" {'
+            while IFS= read -r sym; do
+                echo "void $sym(void) { _mlir_stub_abort(\"$sym\"); }"
+            done < /tmp/missing_mlir.txt
+            echo '}'
+        } > /tmp/mlir_stubs.cc
+
+        STUB_SO="$TF_DIR/libmlir_ciface_stubs.so"
+        echo ">>> Compilando $STUB_SO..."
+        $CONDA_PREFIX/bin/powerpc64le-conda-linux-gnu-g++ -shared -fPIC -O0 \
+            -o "$STUB_SO" /tmp/mlir_stubs.cc
+
+        if [ -f "$STUB_SO" ]; then
+            # patchelf falha em libs grandes (libtensorflow_cc.so.2 > limite).
+            # Em vez disso, prepend em tensorflow/__init__.py: usa ctypes.CDLL
+            # com RTLD_GLOBAL pra carregar o stub ANTES de pywrap_tensorflow
+            # carregar libtensorflow_cc.so.2. Os símbolos do stub ficam
+            # disponíveis globalmente, satisfazendo o dlopen subsequente.
+            python3 - "$TF_DIR" << 'INIT_PY_PATCH'
+import os, sys
+tf_dir = sys.argv[1]
+init_path = os.path.join(tf_dir, '__init__.py')
+with open(init_path, 'r') as f:
+    content = f.read()
+if 'libmlir_ciface_stubs' in content:
+    print('SKIP: __init__.py já patcheado')
+else:
+    prepend = (
+        "# PPC64LE: load MLIR ciface stubs before TF\n"
+        "import os as _ppc_os, ctypes as _ppc_ct\n"
+        "_ppc_stub = _ppc_os.path.join(_ppc_os.path.dirname(__file__), 'libmlir_ciface_stubs.so')\n"
+        "if _ppc_os.path.exists(_ppc_stub):\n"
+        "    _ppc_ct.CDLL(_ppc_stub, mode=_ppc_ct.RTLD_GLOBAL)\n"
+        "del _ppc_os, _ppc_ct, _ppc_stub\n\n"
+    )
+    with open(init_path, 'w') as f:
+        f.write(prepend + content)
+    print(f'OK: prepend em {init_path}')
+INIT_PY_PATCH
+            echo ">>> Stubs MLIR carregados via prepend em tensorflow/__init__.py"
+        else
+            echo ">>> ERRO: compilação dos stubs falhou"
+        fi
+    fi
+fi
+
 echo ""
 echo ">>> Executando diagnóstico completo de GPU..."
 cd ~
