@@ -185,9 +185,27 @@ EOF
 chmod +x $HOME/compiler_hijack/gcc
 chmod +x $HOME/compiler_hijack/g++
 ln -sf $HOME/compiler_hijack/g++ $HOME/compiler_hijack/c++
-# Cria symlinks para o ld do sistema no compiler_hijack (suporte a --start-lib)
-ln -sf /usr/bin/ld        $HOME/compiler_hijack/ld
-ln -sf /usr/bin/ld.bfd    $HOME/compiler_hijack/ld.bfd
+# Symlinks de ld/ld.bfd para o compiler_hijack.
+# Preferimos Conda binutils (≥ 2.40, suporta Power10 PCREL relocs do jpegxl/Highway).
+# AlmaLinux 8.10 trás binutils 2.30 que não conhece reloc tipos 132/133.
+# GCC com -fuse-ld=bfd procura por "ld.bfd" SEM prefixo, então criamos symlinks
+# sem prefixo apontando para os binários prefixados do Conda.
+CONDA_LD_PREFIXED="$(command -v powerpc64le-conda-linux-gnu-ld 2>/dev/null || true)"
+CONDA_LD_BFD_PREFIXED="$(command -v powerpc64le-conda-linux-gnu-ld.bfd 2>/dev/null || true)"
+if [ -n "$CONDA_LD_PREFIXED" ] && [ -x "$CONDA_LD_PREFIXED" ]; then
+    ln -sf "$CONDA_LD_PREFIXED" $HOME/compiler_hijack/ld
+    echo ">>> Conda ld -> $CONDA_LD_PREFIXED"
+else
+    ln -sf /usr/bin/ld        $HOME/compiler_hijack/ld
+    echo ">>> AVISO: Conda ld não encontrado, usando /usr/bin/ld"
+fi
+if [ -n "$CONDA_LD_BFD_PREFIXED" ] && [ -x "$CONDA_LD_BFD_PREFIXED" ]; then
+    ln -sf "$CONDA_LD_BFD_PREFIXED" $HOME/compiler_hijack/ld.bfd
+    echo ">>> Conda ld.bfd -> $CONDA_LD_BFD_PREFIXED"
+else
+    ln -sf /usr/bin/ld.bfd    $HOME/compiler_hijack/ld.bfd
+    echo ">>> AVISO: Conda ld.bfd não encontrado, usando /usr/bin/ld.bfd"
+fi
 export PATH=$HOME/compiler_hijack:$PATH
 
 export CC=gcc
@@ -1111,6 +1129,81 @@ find third_party/xla/xla -type f \( -name "BUILD" -o -name "*.bzl" \) | xargs se
 
 sed -i 's/defined(__has_builtin) && __has_builtin(__builtin_vectorelements)/0/g' third_party/xla/xla/codegen/intrinsic/cpp/eigen_unary.cc
 
+# --- PATCH PPC64LE: renomeia anonymous namespace em todos os .cu.cc ---
+# NVCC gera cudafe1.cpp que referencia funções do anonymous namespace do
+# arquivo original. No PPC64LE, isso causa dois sintomas dependendo do linker:
+#   - LLD: rejeita R_PPC64_TOC16_LO contra símbolos de linkage interno em .so
+#   - BFD: "lacks nop, can't restore toc" — compilador emite chamada local
+#          (sem nop), linker decide tratar como PLT e precisa do nop
+# Solução: renomear cada anonymous namespace para um nome único (linkage
+# externo → GOT/PLT consistente, compilador emite nop, linker resolve).
+echo ">>> Patcheando anonymous namespaces em .cu.cc para linkage externo (ppc64le)..."
+python3 - << 'CU_CC_NS_PATCH'
+import os, re, hashlib
+
+def patch_cu_cc(filepath):
+    try:
+        with open(filepath, 'r', errors='ignore') as f:
+            content = f.read()
+    except Exception:
+        return False
+    if 'ppc64le_anon_' in content:
+        return False
+    if not re.search(r'^\s*namespace\s*\{', content, re.MULTILINE):
+        return False
+    h = hashlib.md5(filepath.encode()).hexdigest()[:8]
+    ns_name = f'ppc64le_anon_{h}'
+    # Usa `inline namespace`: membros têm linkage externo (corrige o bug do
+    # NVCC/PPC64LE) E são transparentes pra namespace mãe. O C++17 standard
+    # define que `namespace { ... }` é equivalente a `inline namespace X { ... }
+    # using namespace X;`, então não introduzimos diferença semântica — só damos
+    # um nome e deixamos o linkage externo.
+    new_content = re.sub(
+        r'^(\s*)namespace\s*\{',
+        rf'\1inline namespace {ns_name} {{',
+        content,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    # Match SOMENTE fechos sem nome após "namespace" — o de um anonymous namespace.
+    # `}  // namespace` (fim de linha) ou `}  // anonymous namespace` (fim de linha).
+    # NÃO casa `}  // namespace foo` (esse é fecho de namespace nomeado).
+    new_content2 = re.sub(
+        r'\}\s*//\s*(?:anonymous\s+namespace|namespace)\s*$',
+        f'}}  // namespace {ns_name}',
+        new_content,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if new_content2 == new_content:
+        # Fecho não casou: arquivo sem o comentário convencional. Não escreve
+        # (não queremos deixar o arquivo com open renomeado e fecho/using inconsistentes).
+        return False
+    try:
+        os.chmod(filepath, 0o644)
+    except Exception:
+        pass
+    with open(filepath, 'w') as f:
+        f.write(new_content2)
+    return True
+
+patched = 0
+for root_dir in ['tensorflow', 'third_party/xla']:
+    if not os.path.isdir(root_dir):
+        continue
+    for root, dirs, files in os.walk(root_dir):
+        for f in files:
+            if f.endswith('.cu.cc'):
+                p = os.path.join(root, f)
+                try:
+                    if patch_cu_cc(p):
+                        patched += 1
+                except Exception as e:
+                    print(f'ERROR {p}: {e}')
+
+print(f'Total .cu.cc files patched: {patched}')
+CU_CC_NS_PATCH
+
 # Remove caminhos hardcoded problemáticos nos headers do XLA que quebram o build com stubs externos
 echo ">>> Corrigindo paths hardcoded de CUDA em third_party/xla/xla e tsl..."
 find third_party/xla/xla third_party/xla/third_party/tsl -type f \( -name "*.h" -o -name "*.cc" \) -exec sed -i 's|third_party/gpus/cuda/extras/CUPTI/include/||g; s|third_party/gpus/cuda/include/||g; s|third_party/gpus/cudnn/include/||g; s|third_party/gpus/cudnn/||g; s|third_party/gpus/cuda/||g; s|third_party/tensorrt/||g' {} +
@@ -1895,14 +1988,18 @@ ARGS=()
 IS_CUDA=0
 REAL_NVCC="/root/cuda_unified/bin/nvcc"
 REAL_GCC="$(which powerpc64le-conda-linux-gnu-gcc 2>/dev/null || echo /usr/bin/gcc)"
-# Force host linker from system binutils (not Conda binutils).
-# Conda ld.bfd has failed on PPC64LE relocations from jpegxl in TF 2.21.
-if [ -x /usr/bin/ld ]; then
+# Linker: usa /root/compiler_hijack que tem ld/ld.bfd como symlinks SEM prefixo
+# para os binários do Conda (binutils ≥ 2.40 com suporte a Power10 PCREL relocs
+# do jpegxl Highway). AlmaLinux 8.10 trás binutils 2.30 que falha em reloc 132.
+# Como GCC com -fuse-ld=bfd procura "ld.bfd" sem prefixo, precisamos do symlink.
+if [ -x /root/compiler_hijack/ld.bfd ]; then
+    REAL_LD_DIR="/root/compiler_hijack"
+elif [ -x /usr/bin/ld.bfd ]; then
     REAL_LD_DIR="/usr/bin"
-elif [ -x /bin/ld ]; then
+elif [ -x /bin/ld.bfd ]; then
     REAL_LD_DIR="/bin"
 else
-    REAL_LD_DIR="$(dirname "$(command -v ld 2>/dev/null || echo /usr/bin/ld)")"
+    REAL_LD_DIR="$(dirname "$(command -v ld.bfd 2>/dev/null || echo /usr/bin/ld)")"
 fi
 GCC_FORCE_LD="-B$REAL_LD_DIR"
 
@@ -2164,14 +2261,18 @@ ARGS=()
 IS_CUDA=0
 REAL_NVCC="/root/cuda_unified/bin/nvcc"
 REAL_GCC="$(which powerpc64le-conda-linux-gnu-g++ 2>/dev/null || echo /usr/bin/g++)"
-# Force host linker from system binutils (not Conda binutils).
-# Conda ld.bfd has failed on PPC64LE relocations from jpegxl in TF 2.21.
-if [ -x /usr/bin/ld ]; then
+# Linker: usa /root/compiler_hijack que tem ld/ld.bfd como symlinks SEM prefixo
+# para os binários do Conda (binutils ≥ 2.40 com suporte a Power10 PCREL relocs
+# do jpegxl Highway). AlmaLinux 8.10 trás binutils 2.30 que falha em reloc 132.
+# Como GCC com -fuse-ld=bfd procura "ld.bfd" sem prefixo, precisamos do symlink.
+if [ -x /root/compiler_hijack/ld.bfd ]; then
+    REAL_LD_DIR="/root/compiler_hijack"
+elif [ -x /usr/bin/ld.bfd ]; then
     REAL_LD_DIR="/usr/bin"
-elif [ -x /bin/ld ]; then
+elif [ -x /bin/ld.bfd ]; then
     REAL_LD_DIR="/bin"
 else
-    REAL_LD_DIR="$(dirname "$(command -v ld 2>/dev/null || echo /usr/bin/ld)")"
+    REAL_LD_DIR="$(dirname "$(command -v ld.bfd 2>/dev/null || echo /usr/bin/ld)")"
 fi
 GCC_FORCE_LD="-B$REAL_LD_DIR"
 
@@ -3378,22 +3479,13 @@ sed -i 's/3\.5/7.0/g' .tf_configure.bazelrc 2>/dev/null || true
 sed -i '/fuse-ld=gold/d' .tf_configure.bazelrc 2>/dev/null || true
 sed -i '/use-gold-linker/d' .tf_configure.bazelrc 2>/dev/null || true
 
-# Escolhe linker do host com foco em PPC64LE+jpegxl:
-# - ld.gold já falhou com reloc 116/132/133
-# - ld.bfd também falhou em tentativas anteriores
-# Tentamos forçar lld; se não existir, tentamos instalar.
-if ! command -v ld.lld >/dev/null 2>&1 && [ ! -x /usr/bin/ld.lld ]; then
-    echo ">>> ld.lld não encontrado. Tentando instalar via dnf..."
-    dnf install -y lld clang-libs 2>/dev/null || dnf install -y lld 2>/dev/null || true
-fi
-
-if [ -x /usr/bin/ld.lld ] || command -v ld.lld >/dev/null 2>&1; then
-    BAZEL_FUSE_LD="lld"
-else
-    # Fallback de emergência (pode falhar com jpegxl no ppc64le).
-    BAZEL_FUSE_LD="bfd"
-    echo ">>> AVISO: ld.lld indisponível; usando fallback -fuse-ld=bfd"
-fi
+# Linker do host: BFD.
+# ld.lld recusa R_PPC64_TOC16_LO contra símbolos de linkage interno (anonymous
+# namespace) em shared libs — comportamento estrito que não corresponde ao
+# ELFv2 ABI. NVCC gera muitos desses em .cu.cc, e patchear cada arquivo é
+# inviável (também afeta typeinfo, lambdas internas, etc.). BFD aceita
+# corretamente.
+BAZEL_FUSE_LD="bfd"
 echo ">>> Linker selecionado para Bazel: -fuse-ld=${BAZEL_FUSE_LD}"
 
 bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
@@ -3418,6 +3510,10 @@ bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --copt=-DPYBIND11_MODULE_LOCAL="" \
     --linkopt=-fuse-ld=${BAZEL_FUSE_LD} \
     --host_linkopt=-fuse-ld=${BAZEL_FUSE_LD} \
+    --linkopt=-Wl,-z,notext \
+    --host_linkopt=-Wl,-z,notext \
+    --linkopt=-Wl,-Bsymbolic-functions \
+    --host_linkopt=-Wl,-Bsymbolic-functions \
     --linkopt=-Wl,--export-dynamic \
     --linkopt=-Wl,--unresolved-symbols=ignore-all \
     --linkopt=-Wl,--allow-multiple-definition \
