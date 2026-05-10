@@ -1129,15 +1129,121 @@ find third_party/xla/xla -type f \( -name "BUILD" -o -name "*.bzl" \) | xargs se
 
 sed -i 's/defined(__has_builtin) && __has_builtin(__builtin_vectorelements)/0/g' third_party/xla/xla/codegen/intrinsic/cpp/eigen_unary.cc
 
+# --- PATCH PPC64LE: select_k_thunk usa _stub em vez de _raft ---
+# O BUILD do select_k_thunk usa if_cuda_is_configured pra escolher entre
+# select_k_exec_raft (NVIDIA RAFT lib, não disponível em PPC64LE) e _stub.
+# Como temos CUDA configurado, ele escolhe _raft, mas o @raft repo não existe
+# de fato (TF assume que CUDA implica RAFT, o que não vale fora de x86_64).
+# Forçamos uso do _stub. Top-K vai retornar UnimplementedError em runtime —
+# raro, geralmente só usado em ops de classificação/ranking.
+echo ">>> Patcheando select_k_thunk BUILD para usar _stub em vez de _raft..."
+python3 - << 'SELECT_K_PATCH'
+import os, re
+p = 'third_party/xla/xla/backends/gpu/runtime/BUILD'
+if not os.path.exists(p):
+    print(f'AVISO: {p} não encontrado')
+else:
+    with open(p, 'r') as f:
+        content = f.read()
+    if 'ppc64le_select_k_stub' in content:
+        print('SKIP: já patcheado')
+    else:
+        # Substitui a primeira ocorrência: a linha [":select_k_exec_raft"]
+        # dentro do if_cuda_is_configured(...) do target select_k_thunk.
+        new_content = content.replace(
+            '[":select_k_exec_raft"],\n        no_cuda = [":select_k_exec_stub"],',
+            '[":select_k_exec_stub"],  # ppc64le_select_k_stub: was _raft\n        no_cuda = [":select_k_exec_stub"],',
+            1,
+        )
+        if new_content == content:
+            # Tentativa fallback: regex multiline mais flexível
+            new_content = re.sub(
+                r'if_cuda_is_configured\(\s*\[":select_k_exec_raft"\]',
+                'if_cuda_is_configured(\n        [":select_k_exec_stub"]  # ppc64le_select_k_stub',
+                content,
+                count=1,
+            )
+        if new_content != content:
+            with open(p, 'w') as f:
+                f.write(new_content)
+            print(f'PATCHED: {p}')
+        else:
+            print(f'AVISO: padrão não casou em {p}')
+SELECT_K_PATCH
+
+# --- PATCH PPC64LE: desabilita mlir_generated GPU kernels ---
+# Esses kernels dependem do hlo_to_kernel rodando como build tool, que não linka
+# nesta build (protobuf duplicate symbols + outros issues). Os .cc files em
+# tensorflow/core/kernels/mlir_generated/gpu_op_*.cc só fazem registro de
+# kernels (REGISTER_KERNEL_BUILDER) — não são referenciados de fora. Esvaziar
+# faz com que esses kernels MLIR não sejam registrados, e TF cai nas
+# implementações não-MLIR (Eigen/cuDNN tradicionais) pra Relu/Elu/Cast/etc.
+echo ">>> Esvaziando gpu_op_*.cc em mlir_generated (desabilita MLIR codegen)..."
+python3 - << 'EMPTY_MLIR_OPS'
+import os, glob
+
+mlir_dir = 'tensorflow/core/kernels/mlir_generated'
+if not os.path.isdir(mlir_dir):
+    print(f'AVISO: {mlir_dir} não existe')
+else:
+    count = 0
+    for path in glob.glob(os.path.join(mlir_dir, 'gpu_op_*.cc')):
+        with open(path, 'r') as f:
+            content = f.read()
+        if 'ppc64le_disabled' in content:
+            continue  # idempotente
+        with open(path, 'w') as f:
+            f.write('// ppc64le_disabled: MLIR-generated GPU kernel registration\n')
+            f.write('// (hlo_to_kernel build tool não linka neste setup; TF usa fallback não-MLIR)\n')
+        count += 1
+    print(f'Esvaziados {count} arquivos gpu_op_*.cc')
+EMPTY_MLIR_OPS
+
+# --- PATCH PPC64LE: host_triple no mlir_generated/build_defs.bzl ---
+# A regra _gen_kernel_library escolhe host_triple via select() que só conhece
+# aarch64 e default=x86_64. No PPC64LE cai em x86_64 → kernel_gen é invocado
+# com triple errado, gera saída inválida (ou nada), e os símbolos
+# _mlir_ciface_* nunca aparecem. O fix é forçar o host_triple correto pra PPC.
+echo ">>> Patcheando mlir_generated/build_defs.bzl para PPC64LE host_triple..."
+python3 - << 'MLIR_TRIPLE_PATCH'
+import os, re
+
+paths = [
+    'tensorflow/core/kernels/mlir_generated/build_defs.bzl',
+]
+for p in paths:
+    if not os.path.exists(p):
+        continue
+    with open(p, 'r') as f:
+        content = f.read()
+    if 'powerpc64le-unknown-linux-gnu' in content:
+        print(f'SKIP: {p} já patcheado')
+        continue
+    # Substitui o select() do host_triple por uma versão que retorna
+    # powerpc64le-unknown-linux-gnu diretamente. Como esse build_defs.bzl
+    # roda no host onde queremos compilar, e nosso host é PPC64LE fixo,
+    # podemos hardcodar (vs tentar adivinhar via @platforms//cpu:ppc).
+    new_content = re.sub(
+        r'host_triple = select\(\{[^}]*"//conditions:default":\s*"x86_64-unknown-linux-gnu"[^}]*\}\)',
+        'host_triple = "powerpc64le-unknown-linux-gnu"',
+        content,
+        flags=re.DOTALL,
+    )
+    if new_content != content:
+        with open(p, 'w') as f:
+            f.write(new_content)
+        print(f'PATCHED: {p}')
+    else:
+        print(f'AVISO: padrão de host_triple não encontrado em {p}')
+MLIR_TRIPLE_PATCH
+
 # --- PATCH PPC64LE: renomeia anonymous namespace em todos os .cu.cc ---
-# NVCC gera cudafe1.cpp que referencia funções do anonymous namespace do
-# arquivo original. No PPC64LE, isso causa dois sintomas dependendo do linker:
-#   - LLD: rejeita R_PPC64_TOC16_LO contra símbolos de linkage interno em .so
-#   - BFD: "lacks nop, can't restore toc" — compilador emite chamada local
-#          (sem nop), linker decide tratar como PLT e precisa do nop
-# Solução: renomear cada anonymous namespace para um nome único (linkage
-# externo → GOT/PLT consistente, compilador emite nop, linker resolve).
-echo ">>> Patcheando anonymous namespaces em .cu.cc para linkage externo (ppc64le)..."
+# DESABILITADO 2026-05-09: esse patch foi pra BFD-strict R_PPC64_TOC16_LO
+# (era LLD). Com BFD não precisamos. E suspeito que tá causando segfault
+# em __sti____cudaRegisterAll por inconsistência entre código fonte e registros
+# gerados pelo cudafe. Mantido o código abaixo se quiser reativar, mas pulo via
+# return cedo no python.
+echo ">>> Aplicando patch de inline namespace nos .cu.cc (necessario para LLD)..."
 python3 - << 'CU_CC_NS_PATCH'
 import os, re, hashlib
 
@@ -2210,7 +2316,11 @@ if [ $IS_CUDA -eq 1 ]; then
     
     # -fPIC: required on ppc64le when linking shared libs with lld (TOC16 relocs).
     # Bazel passes -fPIC but this wrapper strips -f* for NVCC, so inject explicitly.
-    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "--expt-relaxed-constexpr" "-include" "cuda_bf16.h" "-ccbin" "/root/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "/root/miniforge3/include" "-isystem" "/root/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
+    # -cudart=none: do NOT pull in libcudart_static.a. Symbols __cudaRegisterFatBinary
+    # etc are resolved at link time by TF's dynamic stubs (cudart_stub.cc + cudart.tramp.S),
+    # which dlopen libcudart.so.12 and dlsym at runtime. This avoids the BFD/LLD multi-TOC
+    # bug where cudart_static's TOC group conflicts with libtensorflow_framework's.
+    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "--expt-relaxed-constexpr" "-cudart=none" "-include" "cuda_bf16.h" "-ccbin" "/root/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "/root/miniforge3/include" "-isystem" "/root/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
     echo "NVCC ARGS: ${CLEAN_ARGS[@]}" >> /tmp/nvcc_dump.txt
     $REAL_NVCC "${CLEAN_ARGS[@]}"
     RC=$?
@@ -2403,7 +2513,7 @@ if [ $IS_CUDA -eq 1 ]; then
         esac
     done
     
-    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "-ccbin" "/root/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "/root/miniforge3/include" "-isystem" "/root/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
+    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "-cudart=none" "-ccbin" "/root/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "/root/miniforge3/include" "-isystem" "/root/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
     echo "NVCC ARGS: ${CLEAN_ARGS[@]}" >> /tmp/nvcc_dump.txt
     $REAL_NVCC "${CLEAN_ARGS[@]}"
     RC=$?
@@ -3485,8 +3595,184 @@ sed -i '/use-gold-linker/d' .tf_configure.bazelrc 2>/dev/null || true
 # ELFv2 ABI. NVCC gera muitos desses em .cu.cc, e patchear cada arquivo é
 # inviável (também afeta typeinfo, lambdas internas, etc.). BFD aceita
 # corretamente.
-BAZEL_FUSE_LD="bfd"
+BAZEL_FUSE_LD="lld"
 echo ">>> Linker selecionado para Bazel: -fuse-ld=${BAZEL_FUSE_LD}"
+echo ">>> Voltamos pra LLD: BFD 2.40 multi-TOC tem bug de local entry em libs > 64KB de TOC."
+echo ">>> O patch de inline namespace para .cu.cc precisa estar ATIVO para LLD funcionar."
+
+# ----------------------------------------------------------------------------
+# LLD nao auto-gera os stubs _savefpr_NN/_restfpr_NN/_savevr_NN/_restvr_NN/
+# _savegpr_NN/_restgpr_NN que GCC referencia em prologos/epilogos out-of-line
+# (otimizacao para muitos callee-saved registers). BFD gera stubs inline,
+# LLD requer linkagem externa. libgcc tem versoes com double-underscore mas
+# nao com single-underscore, entao geramos os stubs em asm aqui.
+# ----------------------------------------------------------------------------
+SAVRES_DIR=$HOME/ppc64_savres
+mkdir -p "$SAVRES_DIR"
+cat > "$SAVRES_DIR/savres.S" << 'SAVRES_ASM'
+.text
+.machine power9
+
+# Save FP registers fNN..f31 to negative offsets from r1
+.altmacro
+.macro DEFFPR n, off
+.globl _savefpr_\n
+.type _savefpr_\n, @function
+_savefpr_\n:
+    stfd \n, \off(1)
+.endm
+.macro DEFFPR_REST n, off
+.globl _restfpr_\n
+.type _restfpr_\n, @function
+_restfpr_\n:
+    lfd \n, \off(1)
+.endm
+
+# _savefpr_14 .. _savefpr_31 (fall-through chain, ends with blr)
+DEFFPR 14, -144
+DEFFPR 15, -136
+DEFFPR 16, -128
+DEFFPR 17, -120
+DEFFPR 18, -112
+DEFFPR 19, -104
+DEFFPR 20, -96
+DEFFPR 21, -88
+DEFFPR 22, -80
+DEFFPR 23, -72
+DEFFPR 24, -64
+DEFFPR 25, -56
+DEFFPR 26, -48
+DEFFPR 27, -40
+DEFFPR 28, -32
+DEFFPR 29, -24
+DEFFPR 30, -16
+DEFFPR 31, -8
+    blr
+
+# _restfpr_14 .. _restfpr_31
+DEFFPR_REST 14, -144
+DEFFPR_REST 15, -136
+DEFFPR_REST 16, -128
+DEFFPR_REST 17, -120
+DEFFPR_REST 18, -112
+DEFFPR_REST 19, -104
+DEFFPR_REST 20, -96
+DEFFPR_REST 21, -88
+DEFFPR_REST 22, -80
+DEFFPR_REST 23, -72
+DEFFPR_REST 24, -64
+DEFFPR_REST 25, -56
+DEFFPR_REST 26, -48
+DEFFPR_REST 27, -40
+DEFFPR_REST 28, -32
+DEFFPR_REST 29, -24
+DEFFPR_REST 30, -16
+DEFFPR_REST 31, -8
+    blr
+
+# Save GPRs r14..r31
+.macro DEFGPR n, off
+.globl _savegpr_\n
+.type _savegpr_\n, @function
+_savegpr_\n:
+    std \n, \off(1)
+.endm
+.macro DEFGPR_REST n, off
+.globl _restgpr_\n
+.type _restgpr_\n, @function
+_restgpr_\n:
+    ld \n, \off(1)
+.endm
+
+DEFGPR 14, -144
+DEFGPR 15, -136
+DEFGPR 16, -128
+DEFGPR 17, -120
+DEFGPR 18, -112
+DEFGPR 19, -104
+DEFGPR 20, -96
+DEFGPR 21, -88
+DEFGPR 22, -80
+DEFGPR 23, -72
+DEFGPR 24, -64
+DEFGPR 25, -56
+DEFGPR 26, -48
+DEFGPR 27, -40
+DEFGPR 28, -32
+DEFGPR 29, -24
+DEFGPR 30, -16
+DEFGPR 31, -8
+    blr
+
+DEFGPR_REST 14, -144
+DEFGPR_REST 15, -136
+DEFGPR_REST 16, -128
+DEFGPR_REST 17, -120
+DEFGPR_REST 18, -112
+DEFGPR_REST 19, -104
+DEFGPR_REST 20, -96
+DEFGPR_REST 21, -88
+DEFGPR_REST 22, -80
+DEFGPR_REST 23, -72
+DEFGPR_REST 24, -64
+DEFGPR_REST 25, -56
+DEFGPR_REST 26, -48
+DEFGPR_REST 27, -40
+DEFGPR_REST 28, -32
+DEFGPR_REST 29, -24
+DEFGPR_REST 30, -16
+DEFGPR_REST 31, -8
+    blr
+
+# Save Vector Regs v20..v31 (ALTIVEC, 16-byte aligned)
+.macro DEFVR n, off
+.globl _savevr_\n
+.type _savevr_\n, @function
+_savevr_\n:
+    li 0, \off
+    stvx \n, 0, 1
+.endm
+.macro DEFVR_REST n, off
+.globl _restvr_\n
+.type _restvr_\n, @function
+_restvr_\n:
+    li 0, \off
+    lvx \n, 0, 1
+.endm
+
+DEFVR 20, -192
+DEFVR 21, -176
+DEFVR 22, -160
+DEFVR 23, -144
+DEFVR 24, -128
+DEFVR 25, -112
+DEFVR 26, -96
+DEFVR 27, -80
+DEFVR 28, -64
+DEFVR 29, -48
+DEFVR 30, -32
+DEFVR 31, -16
+    blr
+
+DEFVR_REST 20, -192
+DEFVR_REST 21, -176
+DEFVR_REST 22, -160
+DEFVR_REST 23, -144
+DEFVR_REST 24, -128
+DEFVR_REST 25, -112
+DEFVR_REST 26, -96
+DEFVR_REST 27, -80
+DEFVR_REST 28, -64
+DEFVR_REST 29, -48
+DEFVR_REST 30, -32
+DEFVR_REST 31, -16
+    blr
+SAVRES_ASM
+
+echo ">>> Compilando stubs PPC64 save/restore para LLD..."
+gcc -c -fPIC -mcpu=power9 -o "$SAVRES_DIR/savres.o" "$SAVRES_DIR/savres.S"
+ar rcs "$SAVRES_DIR/libppc64_savres.a" "$SAVRES_DIR/savres.o"
+echo ">>> $SAVRES_DIR/libppc64_savres.a gerado"
 
 bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --config=cuda \
@@ -3515,11 +3801,16 @@ bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --linkopt=-Wl,-Bsymbolic-functions \
     --host_linkopt=-Wl,-Bsymbolic-functions \
     --linkopt=-Wl,--export-dynamic \
-    --linkopt=-Wl,--unresolved-symbols=ignore-all \
     --linkopt=-Wl,--allow-multiple-definition \
     --linkopt=-Wl,--allow-shlib-undefined \
     --host_linkopt=-Wl,--allow-multiple-definition \
     --host_linkopt=-Wl,--allow-shlib-undefined \
+    --linkopt=-static-libgcc \
+    --host_linkopt=-static-libgcc \
+    --linkopt=-L$HOME/ppc64_savres \
+    --linkopt=-Wl,--whole-archive,-lppc64_savres,--no-whole-archive \
+    --host_linkopt=-L$HOME/ppc64_savres \
+    --host_linkopt=-Wl,--whole-archive,-lppc64_savres,--no-whole-archive \
     --extra_toolchains=@@local_config_python//:py_cc_toolchain \
     --override_repository=rules_ml_toolchain=$HOME/rules_ml_toolchain_patched \
     --override_repository=llvm_linux_x86_64=$HOME/llvm_stub \
@@ -3698,6 +3989,151 @@ del _ctypes, _os, _dir, _hotfix, _conda_lib\
     echo "   -> self_check.py configurado para auto-load da vacina NVML e cuDNN integral."
 fi
 
+# ----------------------------------------------------------------------------
+# Patch BFD PPC64LE multi-TOC bug: 'nop' apos 'bl <long_branch_stub>' deveria ter
+# sido reescrito pelo linker para 'ld r2,24(r1)' (recarrega TOC do caller),
+# mas GNU ld 2.40 ppc64le nao faz a reescrita quando a chamada cruza grupos de
+# TOC em libs gigantes (libtensorflow_framework.so.2 ~67MB de .text).
+# Sem o reload, r2 fica com TOC do callee e qualquer addis/addi r2,...
+# subsequente vira lixo -> SIGSEGV em static init de __sti____cudaRegisterAll.
+#
+# Fix: percorrer .text de cada .so do wheel, e para cada bl que aponta para um
+# stub *.long_branch.*, se a instrucao seguinte for nop, reescrever para
+# ld r2,24(r1) (bytes LE 18 00 41 e8). Seguro porque o prologue padrao de
+# qualquer funcao que chama outra funcao sempre faz std r2,24(r1).
+# ----------------------------------------------------------------------------
+echo "   -> Patch BFD PPC64LE multi-TOC: reescrevendo nop -> ld r2,24(r1)..."
+cat > /tmp/patch_toc_nops.py << 'PYEOF'
+#!/usr/bin/env python3
+"""
+Patch SELETIVO de TOC reload em PPC64LE.
+
+BFD 2.40 ppc64le, ao gerar long_branch stubs para chamadas a funcoes
+estaticamente linkadas que vivem em GRUPOS DE TOC DIFERENTES (ex:
+__cudaRegisterFatBinary vindo de libcudart_static.a com .text > 64KB),
+deveria reescrever o 'nop' apos o 'bl' para 'ld r2,24(r1)' (recarga de
+TOC). Em algumas situacoes ele nao faz, e o caller continua usando o r2
+do callee (lixo) -> SIGSEGV no proximo addis/addi r2,X.
+
+Estrategia segura: aplicar a recarga APENAS em chamadas a stubs cujo
+alvo tem prefixo conhecido de bibliotecas estaticas que possuem TOC
+proprio (cudart_static, NVIDIA libs). Outros stubs (intra-modulo, mesma
+TOC) sao deixados como estao para nao quebrar funcoes que nao salvam
+r2 no prologo (ex: TcParser do protobuf).
+"""
+import os, re, struct, subprocess, sys, shutil
+
+LIB = sys.argv[1] if len(sys.argv) > 1 else None
+DRY = '--dry-run' in sys.argv
+if not LIB or not os.path.isfile(LIB):
+    print("Usage: patch_toc_nops.py <lib.so> [--dry-run]"); sys.exit(1)
+
+NOP_LE  = b'\x00\x00\x00\x60'
+LDR2_LE = b'\x18\x00\x41\xe8'  # ld r2,24(r1)
+
+# Prefixos de simbolos cuja chamada CRUZA grupos de TOC.
+# Estes vem de bibliotecas externas (libcuda.so, libnvidia-ml.so, libcudnn etc)
+# OU bibliotecas estaticas com TOC proprio (cudart_static, NVCC helpers).
+# Cobre cudart, NVCC helpers, NVML, NVRTC, driver API, e principais libs CUDA.
+SAFE_PREFIXES = (
+    '__cuda', '__nv',
+    'cudaInit',
+    'cublas', 'cudnn', 'cufft', 'curand', 'cusolver', 'cusparse',
+    'cudla', 'cudss', 'nvjit', 'nvJit',
+    'nvml', 'nvrtc', 'nvtx',
+    '_ZN4cuda',
+)
+# Driver API libcuda.so: cu seguido de letra maiuscula
+# (cuInit, cuCtxCreate, cuDeviceGetCount, cuModuleLoad, cuMemAlloc, ...)
+DRIVER_API_RE = re.compile(r'^cu[A-Z]')
+
+def name_safe(name):
+    name_clean = name.split('@')[0]
+    if any(name_clean.startswith(p) for p in SAFE_PREFIXES): return True
+    if DRIVER_API_RE.match(name_clean): return True
+    return False
+
+secs = subprocess.run(['readelf','-SW',LIB], capture_output=True, text=True).stdout
+text = None
+for line in secs.splitlines():
+    m = re.search(r'\] \.text\s+\w+\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)', line)
+    if m:
+        text = (int(m.group(1),16), int(m.group(2),16), int(m.group(3),16)); break
+if not text:
+    print(f"  [{os.path.basename(LIB)}] no .text, skip"); sys.exit(0)
+text_va, text_off, text_size = text
+
+# Coleta TODOS os alvos seguros (TOC-changing):
+#   1) long_branch.<__cuda*|__nv*>  -> stubs em libs grandes (>32MB)
+#   2) __cuda*|__nv* T global       -> chamadas diretas em libs pequenas
+nm_out = subprocess.run(['nm',LIB], capture_output=True, text=True).stdout
+safe_addrs = {}     # endereço -> (nome, tipo)
+total_long_branch = 0
+direct_safe = 0
+for line in nm_out.splitlines():
+    p = line.split()
+    if len(p) < 3: continue
+    sym = p[2]
+    target_name = None
+    # BFD long_branch: <hash>.long_branch.<func>
+    if '.long_branch.' in sym:
+        total_long_branch += 1
+        target_name = sym.split('.long_branch.', 1)[1]
+    # LLD long_branch: __long_branch_<func>
+    elif sym.startswith('__long_branch_'):
+        total_long_branch += 1
+        target_name = sym[len('__long_branch_'):]
+    if target_name is not None:
+        if not name_safe(target_name): continue
+        try: safe_addrs[int(p[0], 16)] = (target_name, 'stub')
+        except ValueError: pass
+    elif name_safe(sym):
+        # Chamada direta: aceita simbolos T (global text) ou t (local text)
+        if len(p) >= 3 and p[1] in ('T','t','W','w'):
+            try:
+                safe_addrs[int(p[0], 16)] = (sym, 'direct')
+                direct_safe += 1
+            except ValueError: pass
+
+if not safe_addrs:
+    print(f"  [{os.path.basename(LIB)}] long_branch={total_long_branch} cuda_targets=0, skip")
+    sys.exit(0)
+
+with open(LIB,'rb') as f: data = bytearray(f.read())
+
+patched = 0; scanned = 0
+end = text_off + text_size - 8
+for off in range(text_off, end, 4):
+    insn = struct.unpack('<I', data[off:off+4])[0]
+    if (insn >> 26) & 0x3f != 18: continue   # opcode 18 = b/bl
+    if (insn & 1) != 1: continue             # LK
+    if (insn >> 1) & 1: continue             # AA
+    li = insn & 0x03fffffc
+    if li & 0x02000000: li |= 0xfc000000
+    li_s = struct.unpack('<i', struct.pack('<I', li & 0xffffffff))[0]
+    target_va = (text_va + (off - text_off)) + li_s
+    if target_va in safe_addrs:
+        scanned += 1
+        if data[off+4:off+8] == NOP_LE:
+            if not DRY: data[off+4:off+8] = LDR2_LE
+            patched += 1
+
+n_stubs = sum(1 for v in safe_addrs.values() if v[1]=='stub')
+n_direct = sum(1 for v in safe_addrs.values() if v[1]=='direct')
+print(f"  [{os.path.basename(LIB)}] long_branch={total_long_branch} cuda_targets(stub={n_stubs}+direct={n_direct}) bl->cuda={scanned} patched={patched}")
+if not DRY and patched > 0:
+    bak = LIB + '.pre-toc-patch.bak'
+    if not os.path.exists(bak): shutil.copy(LIB, bak)
+    with open(LIB,'wb') as f: f.write(data)
+PYEOF
+
+echo "   -> Aplicando patch TOC nops (cobre stubs BFD .long_branch. e LLD __long_branch_)..."
+for so_file in $TF_SO_FILES; do
+    python3 /tmp/patch_toc_nops.py "$so_file" || true
+done
+rm -f /tmp/patch_toc_nops.py
+echo "   -> Patch TOC nops aplicado."
+
 echo "   -> Repacotando Wheel..."
 rm original.whl
 zip -q -r "$WHL_FILE" .
@@ -3737,94 +4173,6 @@ ln -sf $CONDA_PREFIX/lib/libcudnn_adv_train.so.8 $HOME/cuda_unified/lib64/libcud
 # GCC 8 do sistema não tem GLIBCXX_3.4.29 (requerido pelo NumPy do Conda).
 # Usa o libstdc++ do Conda que é mais novo.
 export LD_LIBRARY_PATH=$HOME/cuda_unified/lib64:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}
-
-# ==============================================================================
-# STUBS para símbolos _mlir_ciface_* não-definidos
-# ==============================================================================
-# O build linkou libtensorflow_cc.so.2 com --unresolved-symbols=ignore-all,
-# então a .so saiu com símbolos não-definidos (kernels MLIR codegen que não
-# foram empacotados corretamente nesta build PPC64LE). No `import tensorflow`,
-# o dlopen falha no primeiro símbolo faltando.
-# Solução: gerar uma .so com stubs vazios pra cada símbolo `_mlir_ciface_*`
-# faltante e fazer libtensorflow_cc.so.2 depender dela (DT_NEEDED via patchelf).
-# Caveats: ops que usariam esses kernels MLIR gerados (alguns Casts em GPU,
-# certos unary ops em tipos esquisitos) vão chamar stubs vazios e abortar com
-# mensagem clara. O resto do TF (kernels nativos, cuDNN, cuBLAS, etc) funciona.
-echo ""
-echo ">>> Gerando stubs para símbolos _mlir_ciface_* não-definidos..."
-
-TF_DIR="$CONDA_PREFIX/lib/python$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')/site-packages/tensorflow"
-TF_LIB="$TF_DIR/libtensorflow_cc.so.2"
-
-if [ ! -f "$TF_LIB" ]; then
-    echo ">>> AVISO: $TF_LIB não encontrado; pulando geração de stubs"
-else
-    nm -D --undefined-only "$TF_LIB" 2>/dev/null | awk '{print $NF}' | grep '^_mlir_ciface_' | sort -u > /tmp/missing_mlir.txt
-    MISSING_COUNT=$(wc -l < /tmp/missing_mlir.txt)
-    echo ">>> Encontrados $MISSING_COUNT símbolos _mlir_ciface_* não-definidos"
-
-    if [ "$MISSING_COUNT" -gt 0 ]; then
-        # Gera stubs.cc: cada símbolo é uma função void(...) que aborta.
-        # C linkage não checa aridade, então qualquer chamada cai no stub
-        # independente dos argumentos.
-        {
-            echo '// Auto-gerado: stubs para símbolos _mlir_ciface_* não compilados na build PPC64LE'
-            echo '#include <stdio.h>'
-            echo '#include <stdlib.h>'
-            echo
-            echo 'static void _mlir_stub_abort(const char* sym) {'
-            echo '    fprintf(stderr,'
-            echo '            "\\n*** TF PPC64LE stub: chamado MLIR ciface não-compilado: %s ***\\n"'
-            echo '            "Este kernel não foi gerado nesta build. Use um tipo/op alternativo.\\n",'
-            echo '            sym);'
-            echo '    abort();'
-            echo '}'
-            echo
-            echo 'extern "C" {'
-            while IFS= read -r sym; do
-                echo "void $sym(void) { _mlir_stub_abort(\"$sym\"); }"
-            done < /tmp/missing_mlir.txt
-            echo '}'
-        } > /tmp/mlir_stubs.cc
-
-        STUB_SO="$TF_DIR/libmlir_ciface_stubs.so"
-        echo ">>> Compilando $STUB_SO..."
-        $CONDA_PREFIX/bin/powerpc64le-conda-linux-gnu-g++ -shared -fPIC -O0 \
-            -o "$STUB_SO" /tmp/mlir_stubs.cc
-
-        if [ -f "$STUB_SO" ]; then
-            # patchelf falha em libs grandes (libtensorflow_cc.so.2 > limite).
-            # Em vez disso, prepend em tensorflow/__init__.py: usa ctypes.CDLL
-            # com RTLD_GLOBAL pra carregar o stub ANTES de pywrap_tensorflow
-            # carregar libtensorflow_cc.so.2. Os símbolos do stub ficam
-            # disponíveis globalmente, satisfazendo o dlopen subsequente.
-            python3 - "$TF_DIR" << 'INIT_PY_PATCH'
-import os, sys
-tf_dir = sys.argv[1]
-init_path = os.path.join(tf_dir, '__init__.py')
-with open(init_path, 'r') as f:
-    content = f.read()
-if 'libmlir_ciface_stubs' in content:
-    print('SKIP: __init__.py já patcheado')
-else:
-    prepend = (
-        "# PPC64LE: load MLIR ciface stubs before TF\n"
-        "import os as _ppc_os, ctypes as _ppc_ct\n"
-        "_ppc_stub = _ppc_os.path.join(_ppc_os.path.dirname(__file__), 'libmlir_ciface_stubs.so')\n"
-        "if _ppc_os.path.exists(_ppc_stub):\n"
-        "    _ppc_ct.CDLL(_ppc_stub, mode=_ppc_ct.RTLD_GLOBAL)\n"
-        "del _ppc_os, _ppc_ct, _ppc_stub\n\n"
-    )
-    with open(init_path, 'w') as f:
-        f.write(prepend + content)
-    print(f'OK: prepend em {init_path}')
-INIT_PY_PATCH
-            echo ">>> Stubs MLIR carregados via prepend em tensorflow/__init__.py"
-        else
-            echo ">>> ERRO: compilação dos stubs falhou"
-        fi
-    fi
-fi
 
 echo ""
 echo ">>> Executando diagnóstico completo de GPU..."
