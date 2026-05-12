@@ -38,7 +38,7 @@ conda activate tf221_build
 # Os pacotes -dev trazem os headers (.h) necessários para compilação (cusolverDn.h, cublas_v2.h, etc.)
 conda install -c conda-forge cuda-cudart cuda-cudart-dev cuda-libraries cuda-nvrtc cuda-nvcc \
     libcusolver-dev libcublas-dev libcusparse-dev libcufft-dev libcurand-dev cuda-cupti-dev \
-    nccl gcc_linux-ppc64le=11.4 gxx_linux-ppc64le=11.4 -y
+    nccl gcc_linux-ppc64le=11.4 gxx_linux-ppc64le=11.4 lld -y
 
 cd $TF_BUILD_DIR
 rm -rf tensorflow
@@ -61,6 +61,9 @@ echo ">>> Patching absl headers para compatibilidade NVCC cudafe++..."
 
 # First, do bazel fetch to download dependencies
 bazel fetch //tensorflow/tools/pip_package:wheel 2>&1 | tail -3 || true
+
+# buffer_debug_log_structs.h usa _Alignof (macro C) em codigo C++. Bug source TF.
+# Defino macro globalmente via copt para transformar _Alignof -> alignof.
 
 # Find the absl container directory in bazel cache
 BAZEL_OUTPUT_BASE=$(bazel info output_base 2>/dev/null)
@@ -154,8 +157,10 @@ echo ">>> absl headers patched para NVCC!"
 echo ">>> Criando Mutante GCC/NVCC..."
 mkdir -p $HOME/compiler_hijack
 # Prefer Conda GCC (11+) over system GCC (8.5) for C++17 absl compatibility
-CONDA_GCC=$(ls /root/miniforge3/bin/powerpc64le-conda-linux-gnu-gcc 2>/dev/null)
-CONDA_GXX=$(ls /root/miniforge3/bin/powerpc64le-conda-linux-gnu-g++ 2>/dev/null)
+CONDA_GCC=""
+CONDA_GXX=""
+[ -x "$CONDA_BASE/bin/powerpc64le-conda-linux-gnu-gcc" ] && CONDA_GCC="$CONDA_BASE/bin/powerpc64le-conda-linux-gnu-gcc"
+[ -x "$CONDA_BASE/bin/powerpc64le-conda-linux-gnu-g++" ] && CONDA_GXX="$CONDA_BASE/bin/powerpc64le-conda-linux-gnu-g++"
 if [ -n "$CONDA_GCC" ] && [ -x "$CONDA_GCC" ]; then
     REAL_GCC_PATH="$CONDA_GCC"
     REAL_GXX_PATH="${CONDA_GXX:-$CONDA_GCC}"
@@ -205,6 +210,15 @@ if [ -n "$CONDA_LD_BFD_PREFIXED" ] && [ -x "$CONDA_LD_BFD_PREFIXED" ]; then
 else
     ln -sf /usr/bin/ld.bfd    $HOME/compiler_hijack/ld.bfd
     echo ">>> AVISO: Conda ld.bfd não encontrado, usando /usr/bin/ld.bfd"
+fi
+# ld.lld: instalado via conda-forge no início do script. Symlinka no hijack
+# para o GCC com -fuse-ld=lld achar.
+CONDA_LD_LLD="$(command -v ld.lld 2>/dev/null || true)"
+if [ -n "$CONDA_LD_LLD" ] && [ -x "$CONDA_LD_LLD" ]; then
+    ln -sf "$CONDA_LD_LLD" $HOME/compiler_hijack/ld.lld
+    echo ">>> ld.lld -> $CONDA_LD_LLD"
+else
+    echo ">>> AVISO: ld.lld não encontrado. Instale com: conda install -c conda-forge lld"
 fi
 export PATH=$HOME/compiler_hijack:$PATH
 
@@ -2089,17 +2103,17 @@ cat > $HOME/gcc_cuda_wrapper.sh << 'WRAPPER_EOF'
 unset NVCC_APPEND_FLAGS
 unset NVCC_PREPEND_FLAGS
 # CRITICAL: Ensure cicc and ptxas are in PATH for NVCC
-export PATH=/root/miniforge3/nvvm/bin:/root/miniforge3/bin:/root/cuda_unified/bin:$PATH
+export PATH=${CONDA_PREFIX}/nvvm/bin:${CONDA_PREFIX}/bin:${HOME}/cuda_unified/bin:$PATH
 ARGS=()
 IS_CUDA=0
-REAL_NVCC="/root/cuda_unified/bin/nvcc"
+REAL_NVCC="${HOME}/cuda_unified/bin/nvcc"
 REAL_GCC="$(which powerpc64le-conda-linux-gnu-gcc 2>/dev/null || echo /usr/bin/gcc)"
 # Linker: usa /root/compiler_hijack que tem ld/ld.bfd como symlinks SEM prefixo
 # para os binários do Conda (binutils ≥ 2.40 com suporte a Power10 PCREL relocs
 # do jpegxl Highway). AlmaLinux 8.10 trás binutils 2.30 que falha em reloc 132.
 # Como GCC com -fuse-ld=bfd procura "ld.bfd" sem prefixo, precisamos do symlink.
-if [ -x /root/compiler_hijack/ld.bfd ]; then
-    REAL_LD_DIR="/root/compiler_hijack"
+if [ -x "${HOME}/compiler_hijack/ld.bfd" ]; then
+    REAL_LD_DIR="${HOME}/compiler_hijack"
 elif [ -x /usr/bin/ld.bfd ]; then
     REAL_LD_DIR="/usr/bin"
 elif [ -x /bin/ld.bfd ]; then
@@ -2320,7 +2334,7 @@ if [ $IS_CUDA -eq 1 ]; then
     # etc are resolved at link time by TF's dynamic stubs (cudart_stub.cc + cudart.tramp.S),
     # which dlopen libcudart.so.12 and dlsym at runtime. This avoids the BFD/LLD multi-TOC
     # bug where cudart_static's TOC group conflicts with libtensorflow_framework's.
-    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "--expt-relaxed-constexpr" "-cudart=none" "-include" "cuda_bf16.h" "-ccbin" "/root/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "/root/miniforge3/include" "-isystem" "/root/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
+    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "--expt-relaxed-constexpr" "-cudart=none" "-include" "cuda_bf16.h" "-ccbin" "${HOME}/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "${CONDA_PREFIX}/include" "-isystem" "${HOME}/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
     echo "NVCC ARGS: ${CLEAN_ARGS[@]}" >> /tmp/nvcc_dump.txt
     $REAL_NVCC "${CLEAN_ARGS[@]}"
     RC=$?
@@ -2359,6 +2373,9 @@ else
     exec $REAL_GCC $GCC_FORCE_LD -mcpu=power9 "-isystem/usr/local/include/cuda_stub" "${FINAL_ARGS[@]}"
 fi
 WRAPPER_EOF
+# Expande ${HOME} e ${CONDA_PREFIX} no wrapper para os valores reais agora,
+# porque o Bazel limpa o env ao executar actions e essas vars ficam vazias.
+sed -i "s|\${HOME}|$HOME|g; s|\${CONDA_PREFIX}|$CONDA_PREFIX|g" $HOME/gcc_cuda_wrapper.sh
 chmod +x $HOME/gcc_cuda_wrapper.sh
 
 cat > $HOME/gxx_cuda_wrapper.sh << 'WRAPPER_EOF'
@@ -2366,17 +2383,17 @@ cat > $HOME/gxx_cuda_wrapper.sh << 'WRAPPER_EOF'
 unset NVCC_APPEND_FLAGS
 unset NVCC_PREPEND_FLAGS
 # CRITICAL: Ensure cicc and ptxas are in PATH for NVCC
-export PATH=/root/miniforge3/nvvm/bin:/root/miniforge3/bin:/root/cuda_unified/bin:$PATH
+export PATH=${CONDA_PREFIX}/nvvm/bin:${CONDA_PREFIX}/bin:${HOME}/cuda_unified/bin:$PATH
 ARGS=()
 IS_CUDA=0
-REAL_NVCC="/root/cuda_unified/bin/nvcc"
+REAL_NVCC="${HOME}/cuda_unified/bin/nvcc"
 REAL_GCC="$(which powerpc64le-conda-linux-gnu-g++ 2>/dev/null || echo /usr/bin/g++)"
 # Linker: usa /root/compiler_hijack que tem ld/ld.bfd como symlinks SEM prefixo
 # para os binários do Conda (binutils ≥ 2.40 com suporte a Power10 PCREL relocs
 # do jpegxl Highway). AlmaLinux 8.10 trás binutils 2.30 que falha em reloc 132.
 # Como GCC com -fuse-ld=bfd procura "ld.bfd" sem prefixo, precisamos do symlink.
-if [ -x /root/compiler_hijack/ld.bfd ]; then
-    REAL_LD_DIR="/root/compiler_hijack"
+if [ -x "${HOME}/compiler_hijack/ld.bfd" ]; then
+    REAL_LD_DIR="${HOME}/compiler_hijack"
 elif [ -x /usr/bin/ld.bfd ]; then
     REAL_LD_DIR="/usr/bin"
 elif [ -x /bin/ld.bfd ]; then
@@ -2513,7 +2530,7 @@ if [ $IS_CUDA -eq 1 ]; then
         esac
     done
     
-    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "-cudart=none" "-ccbin" "/root/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "/root/miniforge3/include" "-isystem" "/root/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
+    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "-cudart=none" "-ccbin" "${HOME}/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "${CONDA_PREFIX}/include" "-isystem" "${HOME}/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
     echo "NVCC ARGS: ${CLEAN_ARGS[@]}" >> /tmp/nvcc_dump.txt
     $REAL_NVCC "${CLEAN_ARGS[@]}"
     RC=$?
@@ -2552,6 +2569,7 @@ else
     exec $REAL_GCC $GCC_FORCE_LD -mcpu=power9 "-isystem/usr/local/include/cuda_stub" "${FINAL_ARGS[@]}"
 fi
 WRAPPER_EOF
+sed -i "s|\${HOME}|$HOME|g; s|\${CONDA_PREFIX}|$CONDA_PREFIX|g" $HOME/gxx_cuda_wrapper.sh
 chmod +x $HOME/gxx_cuda_wrapper.sh
 
 export CC=$HOME/gcc_cuda_wrapper.sh
@@ -3794,6 +3812,8 @@ bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --host_cxxopt=-fvisibility=default \
     --copt=-DPYBIND11_EXPORT="__attribute__((visibility(\"default\")))" \
     --copt=-DPYBIND11_MODULE_LOCAL="" \
+    --cxxopt=-D_Alignof=alignof \
+    --host_cxxopt=-D_Alignof=alignof \
     --linkopt=-fuse-ld=${BAZEL_FUSE_LD} \
     --host_linkopt=-fuse-ld=${BAZEL_FUSE_LD} \
     --linkopt=-Wl,-z,notext \
