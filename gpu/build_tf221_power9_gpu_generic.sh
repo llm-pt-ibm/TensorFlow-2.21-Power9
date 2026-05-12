@@ -2636,14 +2636,14 @@ if [ -z "$CUDA_H_SRC" ]; then
     exit 1
 fi
 mkdir -p third_party/gpus/cuda/include
-cp -f "$CUDA_H_SRC" third_party/gpus/cuda/include/cuda.h
+cp -f "$CUDA_H_SRC" third_party/gpus/cuda/include/cuda_real.h
 
 # Garante símbolos do CUDA Driver API mesmo se o header copiado for incompleto
-cat > third_party/gpus/cuda/include/cuda.h << CUDA_WRAPPER
+cat > third_party/gpus/cuda/include/cuda.h << 'CUDA_WRAPPER'
 #ifndef TF_CUDA_WRAPPER_H_
 #define TF_CUDA_WRAPPER_H_
 // Wrapper: inclui cuda.h real e define símbolos ausentes se necessário
-#include <${CUDA_H_SRC}>
+#include "cuda_real.h"
 
 #ifndef CUdeviceptr
 typedef unsigned long long CUdeviceptr;
