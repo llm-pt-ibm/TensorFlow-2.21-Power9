@@ -159,8 +159,8 @@ mkdir -p $HOME/compiler_hijack
 # Prefer Conda GCC (11+) over system GCC (8.5) for C++17 absl compatibility
 CONDA_GCC=""
 CONDA_GXX=""
-[ -x "$CONDA_BASE/bin/powerpc64le-conda-linux-gnu-gcc" ] && CONDA_GCC="$CONDA_BASE/bin/powerpc64le-conda-linux-gnu-gcc"
-[ -x "$CONDA_BASE/bin/powerpc64le-conda-linux-gnu-g++" ] && CONDA_GXX="$CONDA_BASE/bin/powerpc64le-conda-linux-gnu-g++"
+[ -x "$CONDA_PREFIX/bin/powerpc64le-conda-linux-gnu-gcc" ] && CONDA_GCC="$CONDA_PREFIX/bin/powerpc64le-conda-linux-gnu-gcc"
+[ -x "$CONDA_PREFIX/bin/powerpc64le-conda-linux-gnu-g++" ] && CONDA_GXX="$CONDA_PREFIX/bin/powerpc64le-conda-linux-gnu-g++"
 if [ -n "$CONDA_GCC" ] && [ -x "$CONDA_GCC" ]; then
     REAL_GCC_PATH="$CONDA_GCC"
     REAL_GXX_PATH="${CONDA_GXX:-$CONDA_GCC}"
@@ -695,7 +695,7 @@ if [ ! -z "${CONDA_PREFIX:-}" ]; then
 fi
 
 # Fragmentação de Conda: `crt/host_defines.h` costuma vir isolado no pacote nvcc, fareja e copia:
-TARGET_CRT=$(find /usr /opt /root $CONDA_PREFIX -path "*/crt/host_defines.h" 2>/dev/null | head -n 1)
+TARGET_CRT=$(find /usr /opt /root $CONDA_PREFIX -path "*/crt/host_defines.h" 2>/dev/null | head -n 1 || true)
 if [ ! -z "$TARGET_CRT" ]; then
     CRT_DIR=$(dirname "$TARGET_CRT")
     echo ">>> Achei o CRT isolado em: $CRT_DIR"
@@ -704,7 +704,7 @@ fi
 
 # Fragmentação de Conda: CUPTI headers ficam em extras/CUPTI/include/ (não no include/ principal)
 echo ">>> Buscando headers CUPTI..."
-CUPTI_H=$(find /usr /opt $CONDA_PREFIX $HOME/cuda_unified -name "cupti.h" 2>/dev/null | head -n 1)
+CUPTI_H=$(find /usr /opt $CONDA_PREFIX $HOME/cuda_unified -name "cupti.h" 2>/dev/null | head -n 1 || true)
 if [ ! -z "$CUPTI_H" ]; then
     CUPTI_DIR=$(dirname "$CUPTI_H")
     echo ">>> Achei CUPTI em: $CUPTI_DIR"
@@ -2330,7 +2330,7 @@ if [ $IS_CUDA -eq 1 ]; then
     
     # -fPIC: required on ppc64le when linking shared libs with lld (TOC16 relocs).
     # Bazel passes -fPIC but this wrapper strips -f* for NVCC, so inject explicitly.
-    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "--expt-relaxed-constexpr" "-include" "cuda_bf16.h" "-ccbin" "${HOME}/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "${CONDA_PREFIX}/include" "-isystem" "${HOME}/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
+    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "--compiler-options=-mcmodel=medium" "--expt-relaxed-constexpr" "-include" "cuda_bf16.h" "-ccbin" "${HOME}/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "${CONDA_PREFIX}/include" "-isystem" "${HOME}/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
     echo "NVCC ARGS: ${CLEAN_ARGS[@]}" >> /tmp/nvcc_dump.txt
     $REAL_NVCC "${CLEAN_ARGS[@]}"
     RC=$?
@@ -3858,6 +3858,8 @@ bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --host_cxxopt=-fvisibility=default \
     --copt=-DPYBIND11_EXPORT="__attribute__((visibility(\"default\")))" \
     --copt=-DPYBIND11_MODULE_LOCAL="" \
+    --copt=-mcmodel=medium \
+    --cxxopt=-mcmodel=medium \
     --cxxopt=-D_Alignof=alignof \
     --host_cxxopt=-D_Alignof=alignof \
     --linkopt=-fuse-ld=${BAZEL_FUSE_LD} \
