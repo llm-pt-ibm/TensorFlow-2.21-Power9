@@ -2330,11 +2330,7 @@ if [ $IS_CUDA -eq 1 ]; then
     
     # -fPIC: required on ppc64le when linking shared libs with lld (TOC16 relocs).
     # Bazel passes -fPIC but this wrapper strips -f* for NVCC, so inject explicitly.
-    # -cudart=none: do NOT pull in libcudart_static.a. Symbols __cudaRegisterFatBinary
-    # etc are resolved at link time by TF's dynamic stubs (cudart_stub.cc + cudart.tramp.S),
-    # which dlopen libcudart.so.12 and dlsym at runtime. This avoids the BFD/LLD multi-TOC
-    # bug where cudart_static's TOC group conflicts with libtensorflow_framework's.
-    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "--expt-relaxed-constexpr" "-cudart=none" "-include" "cuda_bf16.h" "-ccbin" "${HOME}/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "${CONDA_PREFIX}/include" "-isystem" "${HOME}/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
+    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "--expt-relaxed-constexpr" "-include" "cuda_bf16.h" "-ccbin" "${HOME}/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "${CONDA_PREFIX}/include" "-isystem" "${HOME}/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
     echo "NVCC ARGS: ${CLEAN_ARGS[@]}" >> /tmp/nvcc_dump.txt
     $REAL_NVCC "${CLEAN_ARGS[@]}"
     RC=$?
@@ -3794,15 +3790,15 @@ DEFGPR_REST 31, -8
 .globl _savevr_\n
 .type _savevr_\n, @function
 _savevr_\n:
-    li 0, \off
-    stvx \n, 0, 1
+    li 11, \off
+    stvx \n, 11, 1
 .endm
 .macro DEFVR_REST n, off
 .globl _restvr_\n
 .type _restvr_\n, @function
 _restvr_\n:
-    li 0, \off
-    lvx \n, 0, 1
+    li 11, \off
+    lvx \n, 11, 1
 .endm
 
 DEFVR 20, -192
@@ -4079,6 +4075,31 @@ python3 -m pip install --force-reinstall --no-deps "$WHL_FILE"
 
 conda install -c conda-forge "h5py>=3.11,<3.15" grpcio libclang ml_dtypes "protobuf>=6.31.1,<8.0.0" libstdcxx-ng cudnn -y
 python3 -m pip install absl-py astunparse flatbuffers gast google-pasta keras opt-einsum termcolor wrapt
+
+# -----------------------------------------------------------------------------
+# Patch ABI PPC64LE: insere `std r2, 24(r1)` que GCC omitiu em __nv_* callbacks
+# gerados por NVCC. Sem isso, o `ld r2, 24(r1)` que LLD insere apos cada
+# `bl __long_branch_*_<__cuda|__nv>*` le memoria de stack nao inicializada,
+# r2 vira lixo, e a proxima stub call segfaulta no init de
+# __sti____cudaRegisterAll.
+#
+# Mecanismo: usa os 16 bytes de zero padding apos cada stub LLD como wrapper:
+#   wrapper @ stub+16:  std r2, 24(r1); b stub
+# Redireciona bls do stub para o wrapper. Idempotente.
+# -----------------------------------------------------------------------------
+echo ">>> Aplicando patch ABI PPC64LE (std r2 ausente em __nv_*)..."
+python3 -c 'import elftools' 2>/dev/null || python3 -m pip install -q pyelftools
+TF_FW_INSTALLED="$(python3 -c 'import os, tensorflow; print(os.path.dirname(tensorflow.__file__) + "/libtensorflow_framework.so.2")')"
+if [ -f "$TF_FW_INSTALLED" ]; then
+    PATCHER_SCRIPT="$(dirname "$0")/patch_nv_toc_save.py"
+    if [ -f "$PATCHER_SCRIPT" ]; then
+        python3 "$PATCHER_SCRIPT" "$TF_FW_INSTALLED" --backup
+    else
+        echo ">>> AVISO: $PATCHER_SCRIPT nao encontrado, pulando patch"
+    fi
+else
+    echo ">>> AVISO: $TF_FW_INSTALLED nao existe, pulando patch"
+fi
 
 # Criar symlinks do cuDNN no cuda_unified (onde o TF busca libs CUDA)
 echo ">>> Linkando cuDNN no cuda_unified..."
