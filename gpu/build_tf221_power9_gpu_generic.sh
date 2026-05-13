@@ -31,14 +31,14 @@ fi
 dnf install -y git gcc gcc-c++ zip unzip which patch wget vim-common
 
 source $CONDA_BASE/etc/profile.d/conda.sh
-conda create -n tf221_build "python=3.11" numpy wheel packaging requests -c conda-forge -y
+conda create -n tf221_build "python=3.11" numpy wheel packaging requests setuptools pip -c conda-forge -y || true
 conda activate tf221_build
 
 # Instala o CUDA toolkit ANTES do build para que cuda_configure() detecte CUDA
 # Os pacotes -dev trazem os headers (.h) necessários para compilação (cusolverDn.h, cublas_v2.h, etc.)
 conda install -c conda-forge cuda-cudart cuda-cudart-dev cuda-libraries cuda-nvrtc cuda-nvcc \
     libcusolver-dev libcublas-dev libcusparse-dev libcufft-dev libcurand-dev cuda-cupti-dev \
-    nccl gcc_linux-ppc64le=11.4 gxx_linux-ppc64le=11.4 lld -y
+    nccl gcc_linux-ppc64le=11.4 gxx_linux-ppc64le=11.4 lld setuptools pip -y
 
 cd $TF_BUILD_DIR
 rm -rf tensorflow
@@ -2589,6 +2589,51 @@ bazel fetch //tensorflow/tools/pip_package:wheel 2>/dev/null || true
 export BAZEL_BASE=$(bazel info output_base 2>/dev/null)
 echo ">>> Base do Bazel definida em: $BAZEL_BASE"
 
+# --- Patch XLA para GCC 11: std::vector::reserve com noexcept move constructor ---
+echo ">>> Patching xla/runtime/execution_graph.h e command_executor.cc para GCC 11..."
+XLA_DIR="$BAZEL_BASE/external/xla/xla"
+if [ ! -d "$XLA_DIR" ]; then
+    XLA_DIR=$(find /root/.cache/bazel -path "*/external/xla/xla" -type d 2>/dev/null | head -1)
+fi
+
+if [ -d "$XLA_DIR" ]; then
+    python3 - "$XLA_DIR" << 'XLA_PATCH_EOF'
+import sys, os, re
+
+xla_dir = sys.argv[1]
+exec_graph_h = os.path.join(xla_dir, "runtime", "execution_graph.h")
+
+if os.path.isfile(exec_graph_h):
+    with open(exec_graph_h, "r") as f:
+        content = f.read()
+    
+    # Add noexcept to move constructor and assignment operator
+    content = re.sub(r'Operation\(Operation&&\)\s*=\s*default;', 'Operation(Operation&&) noexcept = default;', content)
+    content = re.sub(r'Operation&\s*operator=\(Operation&&\)\s*=\s*default;', 'Operation& operator=(Operation&&) noexcept = default;', content)
+    
+    with open(exec_graph_h, "w") as f:
+        f.write(content)
+    print("  PATCHED: execution_graph.h")
+
+cmd_exec_cc = os.path.join(xla_dir, "backends", "gpu", "runtime", "command_executor.cc")
+if os.path.isfile(cmd_exec_cc):
+    with open(cmd_exec_cc, "r") as f:
+        content = f.read()
+    
+    # Add noexcept move constructor and assignment to CommandOperation
+    if 'CommandOperation(CommandOperation&&) noexcept = default;' not in content:
+        insert_text = "\n  CommandOperation(CommandOperation&&) noexcept = default;\n  CommandOperation& operator=(CommandOperation&&) noexcept = default;\n"
+        content = re.sub(r'(class CommandOperation : public ExecutionGraph::Operation \{\n\s*public:)', r'\1' + insert_text, content)
+        with open(cmd_exec_cc, "w") as f:
+            f.write(content)
+        print("  PATCHED: command_executor.cc")
+
+XLA_PATCH_EOF
+else
+    echo ">>> AVISO: Diretório XLA não encontrado no cache do Bazel! O build pode falhar no command_executor.cc."
+fi
+
+
 # 1. Injetor cuDNN
 CUDNN_H=$(find /usr /opt $CONDA_PREFIX -name "cudnn_version.h" 2>/dev/null | head -n 1)
 if [ -z "$CUDNN_H" ]; then
@@ -3607,16 +3652,14 @@ sed -i 's/3\.5/7.0/g' .tf_configure.bazelrc 2>/dev/null || true
 sed -i '/fuse-ld=gold/d' .tf_configure.bazelrc 2>/dev/null || true
 sed -i '/use-gold-linker/d' .tf_configure.bazelrc 2>/dev/null || true
 
-# Linker do host: BFD.
-# ld.lld recusa R_PPC64_TOC16_LO contra símbolos de linkage interno (anonymous
-# namespace) em shared libs — comportamento estrito que não corresponde ao
-# ELFv2 ABI. NVCC gera muitos desses em .cu.cc, e patchear cada arquivo é
-# inviável (também afeta typeinfo, lambdas internas, etc.). BFD aceita
-# corretamente.
+# Linker: LLD.
+#
+# LLD resolve nativamente os problemas de TOC e PLT que o BFD tem.
+# O patch de inline namespace nos arquivos .cu.cc já está ativado para
+# contornar a limitação do LLD com R_PPC64_TOC16_LO contra anonymous namespaces.
 BAZEL_FUSE_LD="lld"
 echo ">>> Linker selecionado para Bazel: -fuse-ld=${BAZEL_FUSE_LD}"
-echo ">>> Voltamos pra LLD: BFD 2.40 multi-TOC tem bug de local entry em libs > 64KB de TOC."
-echo ">>> O patch de inline namespace para .cu.cc precisa estar ATIVO para LLD funcionar."
+echo ">>> Usando LLD para evitar corrupção de binário pelo BFD 2.40"
 
 # ----------------------------------------------------------------------------
 # LLD nao auto-gera os stubs _savefpr_NN/_restfpr_NN/_savevr_NN/_restvr_NN/
@@ -3624,7 +3667,11 @@ echo ">>> O patch de inline namespace para .cu.cc precisa estar ATIVO para LLD f
 # (otimizacao para muitos callee-saved registers). BFD gera stubs inline,
 # LLD requer linkagem externa. libgcc tem versoes com double-underscore mas
 # nao com single-underscore, entao geramos os stubs em asm aqui.
+#
+# Com BFD (atual), esse bloco eh dispensavel mas mantemos para o caso de
+# voltar para LLD. Pulamos a geracao se BAZEL_FUSE_LD nao for lld.
 # ----------------------------------------------------------------------------
+if [ "$BAZEL_FUSE_LD" = "lld" ]; then
 SAVRES_DIR=$HOME/ppc64_savres
 mkdir -p "$SAVRES_DIR"
 cat > "$SAVRES_DIR/savres.S" << 'SAVRES_ASM'
@@ -3791,6 +3838,9 @@ echo ">>> Compilando stubs PPC64 save/restore para LLD..."
 gcc -c -fPIC -mcpu=power9 -o "$SAVRES_DIR/savres.o" "$SAVRES_DIR/savres.S"
 ar rcs "$SAVRES_DIR/libppc64_savres.a" "$SAVRES_DIR/savres.o"
 echo ">>> $SAVRES_DIR/libppc64_savres.a gerado"
+else
+echo ">>> BFD em uso: pulando geracao de libppc64_savres.a (BFD auto-gera stubs save/restore)"
+fi
 
 bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --config=cuda \
@@ -3993,18 +4043,13 @@ rm "$HOTFIX_FILE"
 SELFCHECK=$(find . -name "self_check.py" | head -1)
 if [ -n "$SELFCHECK" ]; then
     sed -i '1i\
-# ppc64le GPU patch: pre-load NVML hotfix and cuDNN\
+# ppc64le GPU patch: pre-load NVML hotfix\
 import ctypes as _ctypes, os as _os\
 _dir = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))\
 _hotfix = _os.path.join(_dir, "libnvml_hotfix.so")\
 if _os.path.exists(_hotfix):\
     _ctypes.CDLL(_hotfix, _os.RTLD_NOW | _os.RTLD_GLOBAL)\
-_conda_lib = _os.path.join(_os.environ.get("CONDA_PREFIX", ""), "lib")\
-for _libname in ["libcudnn.so.8", "libcudnn_ops_infer.so.8", "libcudnn_cnn_infer.so.8", "libcudnn_cnn_train.so.8", "libcudnn_ops_train.so.8", "libcudnn_adv_infer.so.8", "libcudnn_adv_train.so.8"]:\
-    _libpath = _os.path.join(_conda_lib, _libname)\
-    if _os.path.exists(_libpath):\
-        _ctypes.CDLL(_libpath, _os.RTLD_NOW | _os.RTLD_GLOBAL)\
-del _ctypes, _os, _dir, _hotfix, _conda_lib\
+del _ctypes, _os, _dir, _hotfix\
 ' "$SELFCHECK"
     echo "   -> self_check.py configurado para auto-load da vacina NVML e cuDNN integral."
 fi
@@ -4022,137 +4067,7 @@ fi
 # ld r2,24(r1) (bytes LE 18 00 41 e8). Seguro porque o prologue padrao de
 # qualquer funcao que chama outra funcao sempre faz std r2,24(r1).
 # ----------------------------------------------------------------------------
-echo "   -> Patch BFD PPC64LE multi-TOC: reescrevendo nop -> ld r2,24(r1)..."
-cat > /tmp/patch_toc_nops.py << 'PYEOF'
-#!/usr/bin/env python3
-"""
-Patch SELETIVO de TOC reload em PPC64LE.
-
-BFD 2.40 ppc64le, ao gerar long_branch stubs para chamadas a funcoes
-estaticamente linkadas que vivem em GRUPOS DE TOC DIFERENTES (ex:
-__cudaRegisterFatBinary vindo de libcudart_static.a com .text > 64KB),
-deveria reescrever o 'nop' apos o 'bl' para 'ld r2,24(r1)' (recarga de
-TOC). Em algumas situacoes ele nao faz, e o caller continua usando o r2
-do callee (lixo) -> SIGSEGV no proximo addis/addi r2,X.
-
-Estrategia segura: aplicar a recarga APENAS em chamadas a stubs cujo
-alvo tem prefixo conhecido de bibliotecas estaticas que possuem TOC
-proprio (cudart_static, NVIDIA libs). Outros stubs (intra-modulo, mesma
-TOC) sao deixados como estao para nao quebrar funcoes que nao salvam
-r2 no prologo (ex: TcParser do protobuf).
-"""
-import os, re, struct, subprocess, sys, shutil
-
-LIB = sys.argv[1] if len(sys.argv) > 1 else None
-DRY = '--dry-run' in sys.argv
-if not LIB or not os.path.isfile(LIB):
-    print("Usage: patch_toc_nops.py <lib.so> [--dry-run]"); sys.exit(1)
-
-NOP_LE  = b'\x00\x00\x00\x60'
-LDR2_LE = b'\x18\x00\x41\xe8'  # ld r2,24(r1)
-
-# Prefixos de simbolos cuja chamada CRUZA grupos de TOC.
-# Estes vem de bibliotecas externas (libcuda.so, libnvidia-ml.so, libcudnn etc)
-# OU bibliotecas estaticas com TOC proprio (cudart_static, NVCC helpers).
-# Cobre cudart, NVCC helpers, NVML, NVRTC, driver API, e principais libs CUDA.
-SAFE_PREFIXES = (
-    '__cuda', '__nv',
-    'cudaInit',
-    'cublas', 'cudnn', 'cufft', 'curand', 'cusolver', 'cusparse',
-    'cudla', 'cudss', 'nvjit', 'nvJit',
-    'nvml', 'nvrtc', 'nvtx',
-    '_ZN4cuda',
-)
-# Driver API libcuda.so: cu seguido de letra maiuscula
-# (cuInit, cuCtxCreate, cuDeviceGetCount, cuModuleLoad, cuMemAlloc, ...)
-DRIVER_API_RE = re.compile(r'^cu[A-Z]')
-
-def name_safe(name):
-    name_clean = name.split('@')[0]
-    if any(name_clean.startswith(p) for p in SAFE_PREFIXES): return True
-    if DRIVER_API_RE.match(name_clean): return True
-    return False
-
-secs = subprocess.run(['readelf','-SW',LIB], capture_output=True, text=True).stdout
-text = None
-for line in secs.splitlines():
-    m = re.search(r'\] \.text\s+\w+\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)', line)
-    if m:
-        text = (int(m.group(1),16), int(m.group(2),16), int(m.group(3),16)); break
-if not text:
-    print(f"  [{os.path.basename(LIB)}] no .text, skip"); sys.exit(0)
-text_va, text_off, text_size = text
-
-# Coleta TODOS os alvos seguros (TOC-changing):
-#   1) long_branch.<__cuda*|__nv*>  -> stubs em libs grandes (>32MB)
-#   2) __cuda*|__nv* T global       -> chamadas diretas em libs pequenas
-nm_out = subprocess.run(['nm',LIB], capture_output=True, text=True).stdout
-safe_addrs = {}     # endereço -> (nome, tipo)
-total_long_branch = 0
-direct_safe = 0
-for line in nm_out.splitlines():
-    p = line.split()
-    if len(p) < 3: continue
-    sym = p[2]
-    target_name = None
-    # BFD long_branch: <hash>.long_branch.<func>
-    if '.long_branch.' in sym:
-        total_long_branch += 1
-        target_name = sym.split('.long_branch.', 1)[1]
-    # LLD long_branch: __long_branch_<func>
-    elif sym.startswith('__long_branch_'):
-        total_long_branch += 1
-        target_name = sym[len('__long_branch_'):]
-    if target_name is not None:
-        if not name_safe(target_name): continue
-        try: safe_addrs[int(p[0], 16)] = (target_name, 'stub')
-        except ValueError: pass
-    elif name_safe(sym):
-        # Chamada direta: aceita simbolos T (global text) ou t (local text)
-        if len(p) >= 3 and p[1] in ('T','t','W','w'):
-            try:
-                safe_addrs[int(p[0], 16)] = (sym, 'direct')
-                direct_safe += 1
-            except ValueError: pass
-
-if not safe_addrs:
-    print(f"  [{os.path.basename(LIB)}] long_branch={total_long_branch} cuda_targets=0, skip")
-    sys.exit(0)
-
-with open(LIB,'rb') as f: data = bytearray(f.read())
-
-patched = 0; scanned = 0
-end = text_off + text_size - 8
-for off in range(text_off, end, 4):
-    insn = struct.unpack('<I', data[off:off+4])[0]
-    if (insn >> 26) & 0x3f != 18: continue   # opcode 18 = b/bl
-    if (insn & 1) != 1: continue             # LK
-    if (insn >> 1) & 1: continue             # AA
-    li = insn & 0x03fffffc
-    if li & 0x02000000: li |= 0xfc000000
-    li_s = struct.unpack('<i', struct.pack('<I', li & 0xffffffff))[0]
-    target_va = (text_va + (off - text_off)) + li_s
-    if target_va in safe_addrs:
-        scanned += 1
-        if data[off+4:off+8] == NOP_LE:
-            if not DRY: data[off+4:off+8] = LDR2_LE
-            patched += 1
-
-n_stubs = sum(1 for v in safe_addrs.values() if v[1]=='stub')
-n_direct = sum(1 for v in safe_addrs.values() if v[1]=='direct')
-print(f"  [{os.path.basename(LIB)}] long_branch={total_long_branch} cuda_targets(stub={n_stubs}+direct={n_direct}) bl->cuda={scanned} patched={patched}")
-if not DRY and patched > 0:
-    bak = LIB + '.pre-toc-patch.bak'
-    if not os.path.exists(bak): shutil.copy(LIB, bak)
-    with open(LIB,'wb') as f: f.write(data)
-PYEOF
-
-echo "   -> Aplicando patch TOC nops (cobre stubs BFD .long_branch. e LLD __long_branch_)..."
-for so_file in $TF_SO_FILES; do
-    python3 /tmp/patch_toc_nops.py "$so_file" || true
-done
-rm -f /tmp/patch_toc_nops.py
-echo "   -> Patch TOC nops aplicado."
+# (TOC patching is no longer needed since BFD is used with --no-multi-toc)
 
 echo "   -> Repacotando Wheel..."
 rm original.whl
@@ -4160,10 +4075,10 @@ zip -q -r "$WHL_FILE" .
 echo ">>> Wheel blindado e vacinado com sucesso!"
 
 cd ~
-pip install --force-reinstall --no-deps "$WHL_FILE"
+python3 -m pip install --force-reinstall --no-deps "$WHL_FILE"
 
 conda install -c conda-forge "h5py>=3.11,<3.15" grpcio libclang ml_dtypes "protobuf>=6.31.1,<8.0.0" libstdcxx-ng cudnn -y
-pip install absl-py astunparse flatbuffers gast google-pasta keras opt-einsum termcolor wrapt
+python3 -m pip install absl-py astunparse flatbuffers gast google-pasta keras opt-einsum termcolor wrapt
 
 # Criar symlinks do cuDNN no cuda_unified (onde o TF busca libs CUDA)
 echo ">>> Linkando cuDNN no cuda_unified..."
