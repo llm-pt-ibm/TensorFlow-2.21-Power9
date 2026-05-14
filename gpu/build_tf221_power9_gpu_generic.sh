@@ -3648,14 +3648,22 @@ sed -i 's/3\.5/7.0/g' .tf_configure.bazelrc 2>/dev/null || true
 sed -i '/fuse-ld=gold/d' .tf_configure.bazelrc 2>/dev/null || true
 sed -i '/use-gold-linker/d' .tf_configure.bazelrc 2>/dev/null || true
 
-# Linker: LLD.
+# Linker: LLD + patcher v6 (configuracao FUNCIONAL conhecida).
 #
-# LLD resolve nativamente os problemas de TOC e PLT que o BFD tem.
-# O patch de inline namespace nos arquivos .cu.cc já está ativado para
-# contornar a limitação do LLD com R_PPC64_TOC16_LO contra anonymous namespaces.
+# LLD aceita melhor as relocacoes que BFD em libs grandes. O patcher v6
+# (patch_nv_toc_save.py, invocado apos pip install) cobre o bug ABI PPC64LE
+# que sobra: GCC nao emite `std r2, 24(r1)` em alguns __nv_* callbacks
+# gerados por NVCC, entao LLD insere stubs __long_branch_* inter-TOC que
+# corrompem r2. O patcher injeta wrappers (`std r2,24(r1); b stub`) em
+# 16 bytes de zero padding apos cada stub cuda + bls diretas a __cuda*/__nv*
+# em funcoes sem prologue save.
+#
+# Estado validado: TF importa + 2x V100 detectadas via list_physical_devices.
+# Matmul GPU pode ainda crashar em outras chains nao cobertas (bug
+# arquitetural GCC/NVCC, requer fix upstream).
 BAZEL_FUSE_LD="lld"
 echo ">>> Linker selecionado para Bazel: -fuse-ld=${BAZEL_FUSE_LD}"
-echo ">>> Usando LLD para evitar corrupção de binário pelo BFD 2.40"
+echo ">>> LLD + patcher v6 (patch_nv_toc_save.py aplicado apos pip install)"
 
 # ----------------------------------------------------------------------------
 # LLD nao auto-gera os stubs _savefpr_NN/_restfpr_NN/_savevr_NN/_restvr_NN/
@@ -3834,8 +3842,15 @@ echo ">>> Compilando stubs PPC64 save/restore para LLD..."
 gcc -c -fPIC -mcpu=power9 -o "$SAVRES_DIR/savres.o" "$SAVRES_DIR/savres.S"
 ar rcs "$SAVRES_DIR/libppc64_savres.a" "$SAVRES_DIR/savres.o"
 echo ">>> $SAVRES_DIR/libppc64_savres.a gerado"
+SAVRES_LINKOPTS=(
+    --linkopt=-L$HOME/ppc64_savres
+    --linkopt=-Wl,--whole-archive,-lppc64_savres,--no-whole-archive
+    --host_linkopt=-L$HOME/ppc64_savres
+    --host_linkopt=-Wl,--whole-archive,-lppc64_savres,--no-whole-archive
+)
 else
 echo ">>> BFD em uso: pulando geracao de libppc64_savres.a (BFD auto-gera stubs save/restore)"
+SAVRES_LINKOPTS=()
 fi
 
 bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
@@ -3875,10 +3890,7 @@ bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --host_linkopt=-Wl,--allow-shlib-undefined \
     --linkopt=-static-libgcc \
     --host_linkopt=-static-libgcc \
-    --linkopt=-L$HOME/ppc64_savres \
-    --linkopt=-Wl,--whole-archive,-lppc64_savres,--no-whole-archive \
-    --host_linkopt=-L$HOME/ppc64_savres \
-    --host_linkopt=-Wl,--whole-archive,-lppc64_savres,--no-whole-archive \
+    "${SAVRES_LINKOPTS[@]}" \
     --extra_toolchains=@@local_config_python//:py_cc_toolchain \
     --override_repository=rules_ml_toolchain=$HOME/rules_ml_toolchain_patched \
     --override_repository=llvm_linux_x86_64=$HOME/llvm_stub \
@@ -4065,7 +4077,7 @@ fi
 # ld r2,24(r1) (bytes LE 18 00 41 e8). Seguro porque o prologue padrao de
 # qualquer funcao que chama outra funcao sempre faz std r2,24(r1).
 # ----------------------------------------------------------------------------
-# (TOC patching is no longer needed since BFD is used with --no-multi-toc)
+# (TOC patching feito pos pip install via patch_nv_toc_save.py - veja linha ~4095)
 
 echo "   -> Repacotando Wheel..."
 rm original.whl
@@ -4079,28 +4091,239 @@ conda install -c conda-forge "h5py>=3.11,<3.15" grpcio libclang ml_dtypes "proto
 python3 -m pip install absl-py astunparse flatbuffers gast google-pasta keras opt-einsum termcolor wrapt
 
 # -----------------------------------------------------------------------------
-# Patch ABI PPC64LE: insere `std r2, 24(r1)` que GCC omitiu em __nv_* callbacks
-# gerados por NVCC. Sem isso, o `ld r2, 24(r1)` que LLD insere apos cada
-# `bl __long_branch_*_<__cuda|__nv>*` le memoria de stack nao inicializada,
-# r2 vira lixo, e a proxima stub call segfaulta no init de
-# __sti____cudaRegisterAll.
+# Patch ABI PPC64LE (v6): insere `std r2, 24(r1)` que GCC omitiu em funcoes que
+# chamam CUDA library trampolines (cudart_stub.cc et al).
 #
-# Mecanismo: usa os 16 bytes de zero padding apos cada stub LLD como wrapper:
-#   wrapper @ stub+16:  std r2, 24(r1); b stub
-# Redireciona bls do stub para o wrapper. Idempotente.
+# Causa raiz:
+# - Libs grandes (>64KB TOC) forcam LLD a usar multi-TOC.
+# - GCC ELFv2 nem sempre emite `std r2, 24(r1)` em prologos antes de bls a
+#   simbolos same-`.so` (assume intra-TOC).
+# - Os targets (trampolines `cudart_stub.cc` etc.) tem global entry prologue
+#   que troca r2 ao serem chamados.
+# - Sem o save, o `ld r2, 24(r1)` que LLD patcha apos cada bl le memoria de
+#   stack nao inicializada -> r2 lixo -> crashes em __sti____cudaRegisterAll,
+#   PlatformInitialize, ToStatusSlow, etc.
+#
+# Mecanismo (3 phases):
+# 1. Em padding (16 bytes zeros) APOS cada `__long_branch_<cuda|nv|cublas|
+#    cudnn|...>` stub, instala wrapper `std r2,24(r1); b stub`. Redireciona
+#    bls do stub para o wrapper.
+# 2. Coleta paddings disponiveis em stubs `__long_branch_*` nao-cuda.
+# 3. Para bls diretas a cuda targets em funcoes SEM `std r2,24(r1)` no
+#    prologo, instala wrapper em padding disponivel dentro de range +-32MB.
+# Idempotente.
 # -----------------------------------------------------------------------------
-echo ">>> Aplicando patch ABI PPC64LE (std r2 ausente em __nv_*)..."
+echo ">>> Aplicando patch ABI PPC64LE v6 (std r2 ausente em callers de cuda libs)..."
 python3 -c 'import elftools' 2>/dev/null || python3 -m pip install -q pyelftools
-TF_FW_INSTALLED="$(python3 -c 'import os, tensorflow; print(os.path.dirname(tensorflow.__file__) + "/libtensorflow_framework.so.2")')"
-if [ -f "$TF_FW_INSTALLED" ]; then
-    PATCHER_SCRIPT="$(dirname "$0")/patch_nv_toc_save.py"
-    if [ -f "$PATCHER_SCRIPT" ]; then
-        python3 "$PATCHER_SCRIPT" "$TF_FW_INSTALLED" --backup
-    else
-        echo ">>> AVISO: $PATCHER_SCRIPT nao encontrado, pulando patch"
-    fi
+
+# Patcher v6 embutido inline pra rodar em qualquer container/VM sem depender
+# de arquivo externo. Self-contained.
+PATCHER_SCRIPT=/tmp/patch_nv_toc_save_v6.py
+cat > "$PATCHER_SCRIPT" << 'PATCHER_PYEOF'
+#!/usr/bin/env python3
+"""Patcher v6: wrappa cuda stubs LLD em padding (16 bytes apos cada stub)
+e patcha nops apos bls cuda em funcoes COM `std r2, 24(r1)` no prologue.
+Funcoes sem save tem bls diretas wrappadas usando padding de stubs nao-cuda
+dentro de range +-32MB."""
+import argparse, bisect, shutil, struct, sys
+from pathlib import Path
+
+PPC64_INSN_STD_R2_24_R1 = 0xF8410018
+PPC64_INSN_LD_R2_24_R1 = 0xE8410018
+PPC64_INSN_NOP = 0x60000000
+BL_RANGE = 1 << 25
+
+CUDA_PREFIXES = (
+    "__cuda", "__nv", "cuda", "cublas", "cudnn", "cufft",
+    "curand", "cusolver", "cusparse", "cupti",
+    "nccl", "nvml", "nvrtc", "nvshmem",
+)
+
+def is_cuda_target(name):
+    if not name: return False
+    for p in CUDA_PREFIXES:
+        if name.startswith(p): return True
+    if len(name) >= 3 and name[:2] == "cu" and name[2].isupper():
+        return True
+    return False
+
+def encode_b(disp):
+    w = disp // 4
+    return (18 << 26) | ((w & ((1 << 24) - 1)) << 2)
+
+def decode_bl(insn):
+    if ((insn >> 26) & 0x3F) != 18: return None
+    if ((insn >> 1) & 1) != 0: return None
+    if (insn & 1) != 1: return None
+    li = (insn >> 2) & ((1 << 24) - 1)
+    if li & (1 << 23): li -= (1 << 24)
+    return li * 4
+
+def encode_bl(disp):
+    w = disp // 4
+    return (18 << 26) | ((w & ((1 << 24) - 1)) << 2) | 1
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("so_path")
+    ap.add_argument("--backup", action="store_true")
+    args = ap.parse_args()
+    so_path = Path(args.so_path)
+    from elftools.elf.elffile import ELFFile
+    if args.backup:
+        bak = so_path.with_suffix(so_path.suffix + ".bak")
+        if not bak.exists():
+            shutil.copy2(so_path, bak)
+    with open(so_path, "r+b") as f:
+        elf = ELFFile(f)
+        text = elf.get_section_by_name(".text")
+        if text is None: return 1
+        tv = text["sh_addr"]; to = text["sh_offset"]; ts = text["sh_size"]
+        ss = elf.get_section_by_name(".symtab") or elf.get_section_by_name(".dynsym")
+        if ss is None: return 1
+
+        cuda_stubs = {}
+        cudart_func_addrs = set()
+        all_funcs = []
+        all_long_branch_stubs = []
+        for sym in ss.iter_symbols():
+            name = sym.name or ""
+            if name.startswith("__long_branch_"):
+                all_long_branch_stubs.append((sym["st_value"], name))
+                tail = name[len("__long_branch_"):]
+                if is_cuda_target(tail):
+                    cuda_stubs[sym["st_value"]] = name
+                continue
+            if is_cuda_target(name) and sym["st_value"] > 0:
+                cudart_func_addrs.add(sym["st_value"])
+            st = sym["st_info"]
+            if st["type"] == "STT_FUNC" and sym["st_size"] > 0 and sym["st_value"] > 0:
+                all_funcs.append((sym["st_value"], sym["st_value"] + sym["st_size"]))
+        all_funcs.sort()
+        func_starts = [a for a, _ in all_funcs]
+        all_long_branch_stubs.sort()
+        print(f">>> Stubs: {len(cuda_stubs)} cuda / {len(all_long_branch_stubs)} total | Targets diretos: {len(cudart_func_addrs)}")
+
+        f.seek(to)
+        td = bytearray(f.read(ts))
+        save_cache = {}
+        def func_has_save(s, e):
+            if s in save_cache: return save_cache[s]
+            scan_end = min(e, s + 256)
+            o0, o1 = s - tv, scan_end - tv
+            if o0 < 0 or o1 > len(td):
+                save_cache[s] = False; return False
+            has = False
+            for o in range(o0, o1, 4):
+                if struct.unpack_from("<I", td, o)[0] == PPC64_INSN_STD_R2_24_R1:
+                    has = True; break
+            save_cache[s] = has
+            return has
+        def find_func(v):
+            i = bisect.bisect_right(func_starts, v) - 1
+            if i < 0: return None
+            s, e = all_funcs[i]
+            return (s, e) if s <= v < e else None
+
+        w0 = PPC64_INSN_STD_R2_24_R1
+        w1 = encode_b(-20)
+        installed = already = skipped = 0
+        stub2wrap = {}
+        for sv in sorted(cuda_stubs):
+            o = sv - tv
+            if o < 0 or o + 32 > ts: skipped += 1; continue
+            pad = o + 16
+            ex = bytes(td[pad:pad+8])
+            if struct.unpack("<II", ex) == (w0, w1):
+                already += 1; stub2wrap[sv] = sv + 16; continue
+            if ex != b"\x00"*8: skipped += 1; continue
+            struct.pack_into("<II", td, pad, w0, w1)
+            stub2wrap[sv] = sv + 16
+            installed += 1
+        print(f">>> Cuda-stub wrappers: novos={installed} ja={already} pulados={skipped}")
+
+        available_paddings = []
+        for stub_v, _ in all_long_branch_stubs:
+            if stub_v in cuda_stubs: continue
+            pad_off = (stub_v - tv) + 16
+            if pad_off < 0 or pad_off + 16 > len(td): continue
+            if bytes(td[pad_off:pad_off + 16]) == b"\x00" * 16:
+                available_paddings.append(stub_v + 16)
+        available_paddings.sort()
+
+        wrap_set = set(stub2wrap.values())
+        used_paddings = set()
+        def find_padding_for(C, T):
+            lo = max(C - BL_RANGE + 16, T + 4 - BL_RANGE)
+            hi = min(C + BL_RANGE - 4, T + 4 + BL_RANGE - 4)
+            i = bisect.bisect_left(available_paddings, lo)
+            while i < len(available_paddings):
+                p = available_paddings[i]
+                if p > hi: break
+                if p not in used_paddings: return p
+                i += 1
+            return None
+
+        bls_p = nops_p = direct_w = direct_fix = direct_unf = 0
+        for off in range(0, len(td)-3, 4):
+            insn = struct.unpack_from("<I", td, off)[0]
+            disp = decode_bl(insn)
+            if disp is None: continue
+            src = tv + off
+            tgt = src + disp
+            need_nop = False
+            if tgt in stub2wrap:
+                struct.pack_into("<I", td, off, encode_bl(stub2wrap[tgt] - src))
+                bls_p += 1; need_nop = True
+            elif tgt in wrap_set:
+                need_nop = True
+            elif tgt in cudart_func_addrs:
+                c = find_func(src)
+                if c is not None and func_has_save(*c):
+                    direct_w += 1; need_nop = True
+                else:
+                    W = find_padding_for(src, tgt)
+                    if W is not None:
+                        pad_off = W - tv
+                        b_disp = tgt - (W + 4)
+                        if -BL_RANGE <= b_disp < BL_RANGE:
+                            struct.pack_into("<II", td, pad_off, w0, encode_b(b_disp))
+                            used_paddings.add(W)
+                            struct.pack_into("<I", td, off, encode_bl(W - src))
+                            direct_fix += 1; need_nop = True
+                        else:
+                            direct_unf += 1
+                    else:
+                        direct_unf += 1
+            if need_nop and off + 4 < len(td):
+                ni = struct.unpack_from("<I", td, off + 4)[0]
+                if ni == PPC64_INSN_NOP:
+                    struct.pack_into("<I", td, off + 4, PPC64_INSN_LD_R2_24_R1)
+                    nops_p += 1
+        print(f">>> bls redirecionadas={bls_p} diretas_com_save={direct_w} diretas_fixed={direct_fix} diretas_unfix={direct_unf}")
+        print(f">>> nops->ld r2: {nops_p}")
+        f.seek(to); f.write(bytes(td)); f.flush()
+    print(">>> Patch v6 OK")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+PATCHER_PYEOF
+chmod +x "$PATCHER_SCRIPT"
+
+TF_INSTALL_DIR="$(python3 -c 'import site; print(site.getsitepackages()[0] + "/tensorflow")')"
+if [ ! -d "$TF_INSTALL_DIR" ]; then
+    echo ">>> AVISO: $TF_INSTALL_DIR nao existe, pulando patch"
 else
-    echo ">>> AVISO: $TF_FW_INSTALLED nao existe, pulando patch"
+    # Lista todas .so com indicadores do bug (__sti____cudaRegisterAll OU
+    # stubs __long_branch_ de cuda libs). Tipicamente: libtensorflow_framework,
+    # libtensorflow_cc, _pywrap_profiler_plugin, lib_pywrap_tensorflow_common.
+    for SO_PATH in $(find "$TF_INSTALL_DIR" -name '*.so*' -type f 2>/dev/null | grep -v '\.bak$'); do
+        if nm "$SO_PATH" 2>/dev/null | grep -qE '__sti____cudaRegisterAll|__long_branch_(cu|nv|nccl)'; then
+            echo ">>> Patching $(basename "$SO_PATH")"
+            python3 "$PATCHER_SCRIPT" "$SO_PATH" --backup
+        fi
+    done
 fi
 
 # Criar symlinks do cuDNN no cuda_unified (onde o TF busca libs CUDA)
