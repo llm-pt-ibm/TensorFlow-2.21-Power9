@@ -1,94 +1,107 @@
 #!/bin/bash
-# Diagnosticar: stOther dos cudart trampolines + ver se R2SaveStubs foram criados
+# Diagnose T4 'lacks nop' mystery + force rebuild se patch nao foi aplicado.
 
 set -o pipefail
 source /root/miniforge3/etc/profile.d/conda.sh
-conda activate tf221_build
+conda activate tf221_build || conda activate base || true
 
-# Restaurar do .bak-v11 antes (estado pos-LLD-patchado, pre-v11-v12)
-TF=/root/miniforge3/envs/tf221_build/lib/python3.11/site-packages/tensorflow
-PLUGIN="$TF/python/profiler/internal/_pywrap_profiler_plugin.so"
+LLD_INSTALL="$HOME/tensorflow_gpu/llvm-install"
+LLD="$LLD_INSTALL/bin/ld.lld"
 
-echo "=== [1] Restore do estado original LLD patchado (pre-patcher-binario) ==="
-for SO in "$TF/libtensorflow_framework.so.2" "$TF/libtensorflow_cc.so.2" \
-         "$TF/python/lib_pywrap_tensorflow_common.so" "$PLUGIN"; do
-    # Procura backup mais antigo (.bak ou .bak-v11)
-    for BAK in "$SO.bak" "$SO.bak-v11"; do
-        if [ -f "$BAK" ]; then
-            cp "$BAK" "$SO"
-            echo "  restored $(basename "$SO") from $(basename "$BAK")"
-            break
-        fi
-    done
+for D in \
+    "$HOME/tensorflow_gpu/lld-ppc64-fix" \
+    "$HOME/tensorflow_gpu" \
+    "$(pwd)/lld-ppc64-fix" \
+    "$(pwd)"; do
+    [ -f "$D/build_patched_lld.sh" ] && SCRIPT_DIR="$D" && break
+done
+TEST_SCRIPT=""
+for P in \
+    "$SCRIPT_DIR/test_lld.sh" \
+    "$SCRIPT_DIR/teste_lld.sh" \
+    "$HOME/tensorflow_gpu/test_lld.sh" \
+    "$HOME/tensorflow_gpu/teste_lld.sh" \
+    "$(pwd)/test_lld.sh" \
+    "$(pwd)/teste_lld.sh"; do
+    [ -f "$P" ] && TEST_SCRIPT="$P" && break
+done
+
+echo "=== [1] LLD info ==="
+ls -la "$LLD"
+realpath "$LLD"
+file "$LLD"
+echo "  ldd $LLD:"
+ldd "$LLD" 2>&1 | head -10 | sed 's/^/    /'
+echo ""
+
+echo "=== [2] Onde 'lacks nop' realmente esta? ==="
+echo ">>> strings (default) em todos arquivos da install:"
+find "$LLD_INSTALL" -type f -exec sh -c 'strings "$1" 2>/dev/null | grep -lq "lacks nop" >/dev/null && echo "  $1"' _ {} \; 2>/dev/null
+N1=$(find "$LLD_INSTALL" -type f -exec sh -c 'strings "$1" 2>/dev/null | grep -c "lacks nop"' _ {} \; 2>/dev/null | awk '{s+=$1} END{print s}')
+echo "  total hits via strings default: $N1"
+echo ""
+echo ">>> strings -a (all sections) em todos arquivos:"
+find "$LLD_INSTALL" -type f 2>/dev/null | while read F; do
+    N=$(strings -a "$F" 2>/dev/null | grep -c "lacks nop")
+    [ "$N" -gt 0 ] && echo "  $F  ($N hits via -a)"
+done
+echo ""
+echo ">>> grep -a binary direto em todos arquivos:"
+find "$LLD_INSTALL" -type f 2>/dev/null | while read F; do
+    N=$(grep -aoc "lacks nop" "$F" 2>/dev/null)
+    [ "$N" -gt 0 ] && echo "  $F  ($N hits via grep -a)"
+done
+echo ""
+echo ">>> .rodata section direto via objdump:"
+objdump -s -j .rodata "$LLD" 2>/dev/null | grep -A1 "lacks" | head -10 || echo "  nada na .rodata do binario principal"
+echo ""
+
+echo "=== [3] Confirma source LLD tem a string original ==="
+LLD_SRC="$SCRIPT_DIR/llvm-project"
+if [ -d "$LLD_SRC" ]; then
+    echo "  Procurando em $LLD_SRC/lld/ELF/Arch/PPC64.cpp:"
+    grep -n "lacks nop" "$LLD_SRC/lld/ELF/Arch/PPC64.cpp" 2>/dev/null | head -5
+    echo ""
+    echo "  Lines 1810-1820:"
+    sed -n '1808,1822p' "$LLD_SRC/lld/ELF/Arch/PPC64.cpp" 2>/dev/null | sed 's/^/    /'
+else
+    echo "  $LLD_SRC NAO existe"
+fi
+echo ""
+
+echo "=== [4] Testar regex python do build script ==="
+if [ -f "$LLD_SRC/lld/ELF/Arch/PPC64.cpp" ]; then
+python3 << PYEOF
+import re
+with open("$LLD_SRC/lld/ELF/Arch/PPC64.cpp") as f:
+    src = f.read()
+p1 = re.compile(r'Err\(ctx\)\s*<<[^;]*?lacks nop[^;]*;', re.DOTALL)
+m1 = p1.findall(src)
+print(f"  Pattern 1 matches: {len(m1)}")
+for m in m1[:3]:
+    print("  ---")
+    print("  " + m.replace("\n", "\n  ")[:400])
+PYEOF
+fi
+echo ""
+
+echo "=== [5] Force rebuild ==="
+echo "  Apagando llvm-build cache + install pra garantir rebuild fresh..."
+rm -rf "$SCRIPT_DIR/llvm-build" 2>/dev/null
+rm -rf "$LLD_INSTALL/bin/lld" "$LLD_INSTALL/bin/ld.lld" 2>/dev/null
+bash "$SCRIPT_DIR/build_patched_lld.sh" 2>&1 | tail -25
+echo ""
+ls -la "$LLD"
+echo ""
+
+echo "=== [6] Pos-rebuild: 'lacks nop' ainda existe? ==="
+find "$LLD_INSTALL" -type f 2>/dev/null | while read F; do
+    N=$(grep -aoc "lacks nop" "$F" 2>/dev/null)
+    [ "$N" -gt 0 ] && echo "  AINDA: $F ($N hits)"
 done
 echo ""
 
-echo "=== [2] stOther dos cudart trampolines em _pywrap_profiler_plugin.so ==="
-python3 << 'PYEOF'
-from elftools.elf.elffile import ELFFile
-
-PLUGIN = "/root/miniforge3/envs/tf221_build/lib/python3.11/site-packages/tensorflow/python/profiler/internal/_pywrap_profiler_plugin.so"
-
-CUDART_NAMES = (
-    "__cudaRegisterFatBinary", "__cudaRegisterFatBinaryEnd",
-    "__cudaRegisterFunction", "__cudaRegisterVar",
-    "cudaMalloc", "cudaFree", "cudaMemcpy",
-    "cublasCreate_v2", "cudnnCreate",
-)
-
-# stOther bits PPC64 ELFv2:
-#   bits 7:5 = localentry value (0..7)
-#     0 = no global entry / leaf
-#     1 = function clobbers r2 (caller must save)
-#     2..7 = power-of-2 offset of local entry from global
-def decode_stOther(so):
-    le = (so >> 5) & 0x7
-    if le == 0: return "no-GE/leaf"
-    if le == 1: return "CLOBBERS_R2 (localentry=1)"
-    return f"GE+{1 << (le-1)} bytes -> LE"
-
-with open(PLUGIN, "rb") as f:
-    e = ELFFile(f)
-    ss = e.get_section_by_name(".symtab") or e.get_section_by_name(".dynsym")
-    print(f"{'name':50} {'value':>14}  stOther  localentry")
-    for sym in ss.iter_symbols():
-        n = sym.name or ""
-        if not any(n.startswith(x) for x in CUDART_NAMES): continue
-        if sym["st_value"] == 0: continue  # UND
-        so = sym["st_other"]["visibility"] if isinstance(sym["st_other"], dict) else sym["st_other"]
-        # pyelftools converte st_other em dict {visibility, local}.
-        # Vamos pegar raw bytes pra ler bits 7:5
-        # Use o atributo entry
-        raw_so = sym.entry["st_other"]
-        if isinstance(raw_so, dict):
-            # decode dict: bits 7:5 dentro de 'local' field?
-            # Fallback: usar getattr ou inspecionar
-            print(f"  RAW: {sym.entry['st_other']}")
-            continue
-        print(f"{n[:50]:50} {sym['st_value']:#14x}  {raw_so:#04x}     {decode_stOther(raw_so)}")
-PYEOF
+echo "=== [7] Rodar testes ==="
+LLD_PATH="$LLD" bash "$TEST_SCRIPT"
 echo ""
-
-echo "=== [3] readelf -s diretamente (mostra stOther string) ==="
-readelf -sW "$PLUGIN" 2>/dev/null | grep -E "__cudaRegisterFatBinary\b|__cudaRegisterFunction\b|cudaMalloc\b|cublasCreate" | head -20
-echo ""
-
-echo "=== [4] Procurar __toc_save_ stubs (R2SaveStubs criados pelo LLD) ==="
-readelf -sW "$PLUGIN" 2>/dev/null | grep "__toc_save_" | head -10
-COUNT=$(readelf -sW "$PLUGIN" 2>/dev/null | grep -c "__toc_save_")
-echo "Total __toc_save_ stubs em _pywrap_profiler_plugin.so: $COUNT"
-echo ""
-
-echo "=== [5] Mesmo em libtensorflow_framework.so.2 ==="
-TF_FW="$TF/libtensorflow_framework.so.2"
-readelf -sW "$TF_FW" 2>/dev/null | grep -E "__cudaRegisterFatBinary\b" | head -5
-echo ""
-COUNT2=$(readelf -sW "$TF_FW" 2>/dev/null | grep -c "__toc_save_")
-echo "Total __toc_save_ stubs em libtensorflow_framework.so.2: $COUNT2"
-echo ""
-
-echo "=== [6] Verificar se o LLD pacheado esta sendo usado ==="
-ls -la $HOME/tensorflow_gpu/llvm-install/bin/ld.lld 2>/dev/null
-echo ""
-echo ">>> Strings de version no LLD binary:"
-strings $HOME/tensorflow_gpu/llvm-install/bin/ld.lld 2>/dev/null | grep -iE "LLD .*Compatible" | head -2
+echo "exit: $?"
