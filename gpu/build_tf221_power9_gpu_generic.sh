@@ -36,9 +36,53 @@ conda activate tf221_build
 
 # Instala o CUDA toolkit ANTES do build para que cuda_configure() detecte CUDA
 # Os pacotes -dev trazem os headers (.h) necessários para compilação (cusolverDn.h, cublas_v2.h, etc.)
-conda install -c conda-forge cuda-cudart cuda-cudart-dev cuda-libraries cuda-nvrtc cuda-nvcc \
-    libcusolver-dev libcublas-dev libcusparse-dev libcufft-dev libcurand-dev cuda-cupti-dev \
-    nccl gcc_linux-ppc64le=11.4 gxx_linux-ppc64le=11.4 lld setuptools pip -y
+conda install -c conda-forge 'cuda-cudart=12.4.*' 'cuda-cudart-dev=12.4.*' 'cuda-libraries=12.4.*' 'cuda-nvrtc=12.4.*' 'cuda-nvcc=12.4.*' \
+    libcusolver-dev libcublas-dev libcusparse-dev libcufft-dev libcurand-dev 'cuda-cupti-dev=12.4.*' \
+    nccl gcc_linux-ppc64le=11.4 gxx_linux-ppc64le=11.4 \
+    'clang=17.*' 'clangxx=17.*' \
+    xz curl \
+    lld setuptools pip -y
+# NOTA: CUDA 12.4.1 é a ÚLTIMA versão com suporte oficial NVIDIA para ppc64le.
+# NVCC 12.4 aceita Clang até 17.x oficialmente.
+# CUDA 12.5+ removeu suporte ppc64le completamente.
+
+# =========================================================================
+# cuDNN 9.0.0 ppc64le da NVIDIA (oficial). Conda-forge so tem cuDNN 8.9.7.
+# cuDNN 9.1+ NAO tem build ppc64le (descontinuado pela NVIDIA).
+# Esse e' o ultimo cuDNN 9 disponivel pra Power9 oficialmente.
+# =========================================================================
+echo ">>> Verificando cuDNN 9 (instalacao oficial NVIDIA)..."
+if [ -f "$CONDA_PREFIX/lib/libcudnn.so.9" ] && \
+   [ "$(readelf -d $CONDA_PREFIX/lib/libcudnn.so.9 2>/dev/null | grep SONAME | grep -c '\.so\.9')" = "1" ]; then
+    echo ">>> cuDNN 9 ja instalado em \$CONDA_PREFIX/lib"
+else
+    echo ">>> Baixando cuDNN 9.0.0 ppc64le (843 MB)..."
+    CUDNN9_URL="https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-ppc64le/cudnn-linux-ppc64le-9.0.0.312_cuda12-archive.tar.xz"
+    CUDNN9_SHA256="b8ef6f249128e1985893a8787a21de35cb83ec47c6dc6fd1809061dd9a3ffb20"
+    mkdir -p $HOME/cudnn9_download
+    cd $HOME/cudnn9_download
+    if [ ! -f cudnn9.tar.xz ]; then
+        curl -L -o cudnn9.tar.xz "$CUDNN9_URL" || exit_with_error 'falha ao baixar cuDNN 9'
+    fi
+    # Validar checksum
+    ACTUAL_SHA=$(sha256sum cudnn9.tar.xz | awk '{print $1}')
+    if [ "$ACTUAL_SHA" != "$CUDNN9_SHA256" ]; then
+        echo "ERRO: checksum cuDNN nao bate. Esperado $CUDNN9_SHA256 obtive $ACTUAL_SHA"
+        rm -f cudnn9.tar.xz
+        exit 1
+    fi
+    echo ">>> Extraindo cuDNN 9..."
+    tar xJf cudnn9.tar.xz
+    EXTRACTED=$(find $HOME/cudnn9_download -maxdepth 1 -type d -name 'cudnn-linux-ppc64le-9*' | head -1)
+    echo ">>> Instalando libs e headers em \$CONDA_PREFIX..."
+    cp -P "$EXTRACTED"/lib/libcudnn* $CONDA_PREFIX/lib/ || exit_with_error 'falha ao copiar libs'
+    cp "$EXTRACTED"/include/*.h $CONDA_PREFIX/include/ 2>/dev/null || true
+    cd $TF_BUILD_DIR
+    echo ">>> cuDNN 9 instalado. SONAMEs:"
+    for so in $CONDA_PREFIX/lib/libcudnn*.so.9; do
+        [ -f "$so" ] && echo "  $(basename $so): $(readelf -d "$so" 2>/dev/null | grep SONAME | awk '{print $NF}' | tr -d '[]')"
+    done
+fi
 
 cd $TF_BUILD_DIR
 rm -rf tensorflow
@@ -157,33 +201,50 @@ echo ">>> absl headers patched para NVCC!"
 echo ">>> Criando Mutante GCC/NVCC..."
 mkdir -p $HOME/compiler_hijack
 # Prefer Conda GCC (11+) over system GCC (8.5) for C++17 absl compatibility
+# Preferimos CLANG (15.x) como host compiler do NVCC. Clang tem suporte
+# nativo a `__builtin_vectorelements` (17+), aceita `-mprefer-vector-width=*`
+# e `-fno-experimental-sanitize-metadata=*` (16+) que GCC rejeita, e em geral eh
+# mais consistente com bug reports do Power9. NVCC 12.4 aceita Clang ate 17.x.
+# Fallback: Conda GCC se Clang nao estiver instalado.
+CONDA_CLANG=""
+CONDA_CLANGXX=""
+[ -x "$CONDA_PREFIX/bin/clang" ] && CONDA_CLANG="$CONDA_PREFIX/bin/clang"
+[ -x "$CONDA_PREFIX/bin/clang++" ] && CONDA_CLANGXX="$CONDA_PREFIX/bin/clang++"
+
 CONDA_GCC=""
 CONDA_GXX=""
 [ -x "$CONDA_PREFIX/bin/powerpc64le-conda-linux-gnu-gcc" ] && CONDA_GCC="$CONDA_PREFIX/bin/powerpc64le-conda-linux-gnu-gcc"
 [ -x "$CONDA_PREFIX/bin/powerpc64le-conda-linux-gnu-g++" ] && CONDA_GXX="$CONDA_PREFIX/bin/powerpc64le-conda-linux-gnu-g++"
-if [ -n "$CONDA_GCC" ] && [ -x "$CONDA_GCC" ]; then
+
+if [ -n "$CONDA_CLANG" ] && [ -x "$CONDA_CLANG" ]; then
+    REAL_GCC_PATH="$CONDA_CLANG"
+    REAL_GXX_PATH="${CONDA_CLANGXX:-$CONDA_CLANG}"
+    echo ">>> Usando Conda Clang: $REAL_GCC_PATH"
+    echo ">>> Versao: $($REAL_GCC_PATH --version | head -1)"
+elif [ -n "$CONDA_GCC" ] && [ -x "$CONDA_GCC" ]; then
     REAL_GCC_PATH="$CONDA_GCC"
     REAL_GXX_PATH="${CONDA_GXX:-$CONDA_GCC}"
-    echo ">>> Usando Conda GCC: $REAL_GCC_PATH"
-    echo ">>> Versão: $($REAL_GCC_PATH --version | head -1)"
+    echo ">>> Fallback: usando Conda GCC: $REAL_GCC_PATH"
+    echo ">>> Versao: $($REAL_GCC_PATH --version | head -1)"
 else
     REAL_GCC_PATH=$(which gcc)
     REAL_GXX_PATH=$(which g++)
-    echo ">>> AVISO: Conda GCC não encontrado, usando sistema: $REAL_GCC_PATH"
+    echo ">>> AVISO: Nem Clang nem Conda GCC encontrados, usando sistema: $REAL_GCC_PATH"
 fi
+
 cat << EOF > $HOME/compiler_hijack/gcc
 #!/bin/bash
-# compiler_hijack/gcc: Passthrough to Conda GCC (C++17 compatible).
-# NVCC uses this via -ccbin for host compilation.
-# -fPIC is always injected: fixes R_PPC64_TOC16_LO in device stubs on PPC64LE.
+# compiler_hijack/gcc: wrapper que aponta pra Clang (ou GCC fallback).
+# NVCC usa via -ccbin pra compilar host code.
+# -fPIC sempre injetado (R_PPC64_TOC16_LO em device stubs PPC64LE).
 exec "$REAL_GCC_PATH" -fPIC "\$@"
 EOF
 
 cat << EOF > $HOME/compiler_hijack/g++
 #!/bin/bash
-# compiler_hijack/g++: Passthrough to Conda G++ (C++17 compatible).
-# NVCC uses this via -ccbin for host compilation.
-# -fPIC is always injected: fixes R_PPC64_TOC16_LO in device stubs on PPC64LE.
+# compiler_hijack/g++: wrapper apontando pra Clang++ (ou G++ fallback).
+# NVCC usa via -ccbin.
+# -fPIC sempre injetado.
 exec "${REAL_GXX_PATH}" -fPIC "\$@"
 EOF
 
@@ -244,10 +305,10 @@ export GCC_HOST_COMPILER_PATH=$(which gcc)
 
 yes "" | ./configure || true
 
-# ---- CORREÇÃO CRÍTICA: Limpar .tf_configure.bazelrc ----
 # O ./configure pode injetar --config=cuda_clang e linkers (lld/gold)
-# que não existem no Power9. Removemos tudo e configuramos manualmente.
-echo ">>> Corrigindo .tf_configure.bazelrc para usar GCC em vez de Clang..."
+# que conflitam com nosso gcc_cuda_wrapper.sh. Removemos tudo e controlamos
+# o compilador manualmente via --action_env=CC.
+echo ">>> Limpando .tf_configure.bazelrc (removendo cuda_clang e linker flags)..."
 if [ -f .tf_configure.bazelrc ]; then
     # Remove linhas problemáticas (com ou sem aspas)
     sed -i '/cuda_clang/d' .tf_configure.bazelrc
@@ -859,7 +920,7 @@ genrule(
     cmd = """cat > $@ << 'CFGEOF'
 #ifndef CUDA_CUDA_CONFIG_H_
 #define CUDA_CUDA_CONFIG_H_
-#define TF_CUDA_VERSION "12.0"
+#define TF_CUDA_VERSION "12.4"
 #define TF_CUDNN_VERSION "9"
 #define TF_CUDA_TOOLKIT_PATH "/usr/local/cuda"
 #define TF_CUDA_CAPABILITIES "3.5,7.0"
@@ -902,7 +963,7 @@ def if_cuda_is_configured(if_true, if_false = []): return if_true
 def is_cuda_configured(): return True
 def cuda_default_copts(): return []
 def cuda_gpu_architectures(): return ["sm_35", "sm_70"]
-def get_cuda_version_number(): return 1200
+def get_cuda_version_number(): return 1204
 def if_cuda_newer_than(ver, if_true, if_false=[]): return if_true
 def if_local_cuda(if_true, if_false=[]): return if_true
 def cuda_copts(**kwargs): return []
@@ -916,7 +977,7 @@ EOF
 cat > $HOME/local_config_cuda_stub/cuda/cuda_config.py << 'PYCFG'
 """Auto-generated CUDA config for ppc64le stub."""
 cuda_toolkit_path = "/usr/local/cuda"
-cuda_version = "12.0"
+cuda_version = "12.4"
 cudnn_version = "9"
 cuda_compute_capabilities = ["3.5", "7.0"]
 PYCFG
@@ -1138,10 +1199,10 @@ sed -i 's/  \].items():/  ).items():/' \
 
 sed -i '1s/^/#include <cstdint>\n/' third_party/xla/xla/backends/cpu/codegen/builtin_fp16.h
 
-find third_party/xla/xla -type f \( -name "BUILD" -o -name "*.bzl" \) | xargs sed -i 's/"-mprefer-vector-width=512"/""/g; s/"-fno-experimental-sanitize-metadata=all"/""/g'
-find third_party/xla/xla -type f \( -name "BUILD" -o -name "*.bzl" \) | xargs sed -i "s/'-mprefer-vector-width=512'/''/g; s/'-fno-experimental-sanitize-metadata=all'/''/g"
-
-sed -i 's/defined(__has_builtin) && __has_builtin(__builtin_vectorelements)/0/g' third_party/xla/xla/codegen/intrinsic/cpp/eigen_unary.cc
+# Com Clang 17 + CUDA 12.4, NÃO precisamos mais dos patches:
+#   -mprefer-vector-width=512: Clang 15+ aceita
+#   -fno-experimental-sanitize-metadata=all: Clang 16+ aceita
+#   __builtin_vectorelements: Clang 17+ tem nativamente
 
 # --- PATCH PPC64LE: select_k_thunk usa _stub em vez de _raft ---
 # O BUILD do select_k_thunk usa if_cuda_is_configured pra escolher entre
@@ -2107,7 +2168,7 @@ export PATH=${CONDA_PREFIX}/nvvm/bin:${CONDA_PREFIX}/bin:${HOME}/cuda_unified/bi
 ARGS=()
 IS_CUDA=0
 REAL_NVCC="${HOME}/cuda_unified/bin/nvcc"
-REAL_GCC="$(which powerpc64le-conda-linux-gnu-gcc 2>/dev/null || echo /usr/bin/gcc)"
+REAL_GCC="${CONDA_PREFIX}/bin/clang"
 # Linker: usa /root/compiler_hijack que tem ld/ld.bfd como symlinks SEM prefixo
 # para os binários do Conda (binutils ≥ 2.40 com suporte a Power10 PCREL relocs
 # do jpegxl Highway). AlmaLinux 8.10 trás binutils 2.30 que falha em reloc 132.
@@ -2290,7 +2351,7 @@ if [ $IS_CUDA -eq 1 ]; then
                 CLEAN_ARGS+=("-Xlinker=${EXPANDED_ARGS[$i+1]}")
                 SKIP_NEXT_ARG=1
                 ;;
-            -Wno-*|-fno-*|-fstack-protector*|-Wall|-Werror*|-Wunused*|-Wformat*|-g0|-ffunction-sections|-fdata-sections|-fvisibility=*|-frandom-seed=*|-pthread) ;;
+            -Wno-*|-fno-*|-fstack-protector*|-Wall|-Werror*|-Wunused*|-Wformat*|-g0|-ffunction-sections|-fdata-sections|-fvisibility=*|-frandom-seed=*|-pthread|-no-canonical-prefixes|--no-canonical-prefixes) ;;
             -D_FORTIFY_SOURCE*|-U_FORTIFY_SOURCE) ;; # Incompatible with -O0
             -MF)
                 DEP_FILE="${EXPANDED_ARGS[$i+1]}"
@@ -2330,7 +2391,7 @@ if [ $IS_CUDA -eq 1 ]; then
     
     # -fPIC: required on ppc64le when linking shared libs with lld (TOC16 relocs).
     # Bazel passes -fPIC but this wrapper strips -f* for NVCC, so inject explicitly.
-    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "--compiler-options=-mcmodel=medium" "--expt-relaxed-constexpr" "-include" "cuda_bf16.h" "-ccbin" "${HOME}/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "${CONDA_PREFIX}/include" "-isystem" "${HOME}/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
+    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "-allow-unsupported-compiler" "--compiler-options=-fPIC" "--compiler-options=-mcmodel=medium" "--expt-relaxed-constexpr" "-include" "cuda_bf16.h" "-ccbin" "${HOME}/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "${CONDA_PREFIX}/include" "-isystem" "${HOME}/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
     echo "NVCC ARGS: ${CLEAN_ARGS[@]}" >> /tmp/nvcc_dump.txt
     $REAL_NVCC "${CLEAN_ARGS[@]}"
     RC=$?
@@ -2383,7 +2444,7 @@ export PATH=${CONDA_PREFIX}/nvvm/bin:${CONDA_PREFIX}/bin:${HOME}/cuda_unified/bi
 ARGS=()
 IS_CUDA=0
 REAL_NVCC="${HOME}/cuda_unified/bin/nvcc"
-REAL_GCC="$(which powerpc64le-conda-linux-gnu-g++ 2>/dev/null || echo /usr/bin/g++)"
+REAL_GCC="$(which clang++ 2>/dev/null || which powerpc64le-conda-linux-gnu-g++ 2>/dev/null || echo /usr/bin/g++)"
 # Linker: usa /root/compiler_hijack que tem ld/ld.bfd como symlinks SEM prefixo
 # para os binários do Conda (binutils ≥ 2.40 com suporte a Power10 PCREL relocs
 # do jpegxl Highway). AlmaLinux 8.10 trás binutils 2.30 que falha em reloc 132.
@@ -2526,7 +2587,7 @@ if [ $IS_CUDA -eq 1 ]; then
         esac
     done
     
-    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "--compiler-options=-fPIC" "-cudart=none" "-ccbin" "${HOME}/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "${CONDA_PREFIX}/include" "-isystem" "${HOME}/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
+    CLEAN_ARGS+=("-x" "cu" "-arch=sm_70" "-O0" "-Xcicc" "-O0" "--ptxas-options=-O0" "-Xcompiler" "-O0" "-allow-unsupported-compiler" "--compiler-options=-fPIC" "-cudart=none" "-ccbin" "${HOME}/compiler_hijack" "-std=c++17" "-DEIGEN_DONT_VECTORIZE" "-D__NO_INLINE__" "-U__VSX__" "-U__ALTIVEC__" "-D_GLIBCXX_USE_CXX11_ABI=1" "-isystem" "${CONDA_PREFIX}/include" "-isystem" "${HOME}/cuda_unified/include" "-isystem" "/usr/local/include/cuda_stub" "-isystem" "/usr/local/cuda/include")
     echo "NVCC ARGS: ${CLEAN_ARGS[@]}" >> /tmp/nvcc_dump.txt
     $REAL_NVCC "${CLEAN_ARGS[@]}"
     RC=$?
@@ -2630,12 +2691,11 @@ else
 fi
 
 
-# 1. Injetor cuDNN
+# 1. Injetor cuDNN (deve estar em $CONDA_PREFIX/include apos download da NVIDIA)
 CUDNN_H=$(find /usr /opt $CONDA_PREFIX -name "cudnn_version.h" 2>/dev/null | head -n 1)
 if [ -z "$CUDNN_H" ]; then
-    echo ">>> Baixando cuDNN via conda..."
-    conda install -c conda-forge cudnn -y
-    CUDNN_H=$(find $CONDA_PREFIX -name "cudnn_version.h" 2>/dev/null | head -n 1)
+    echo ">>> ERRO: cudnn_version.h nao encontrado. cuDNN 9 deveria ter sido instalado no inicio do script."
+    exit 1
 fi
 if [ ! -z "$CUDNN_H" ]; then
     CUDNN_DIR=$(dirname "$CUDNN_H")
@@ -2916,7 +2976,7 @@ KERNELS_DEPS_PATCH
 cat > /tmp/cuda_config.h << 'CFGEOF'
 #ifndef CUDA_CUDA_CONFIG_H_
 #define CUDA_CUDA_CONFIG_H_
-#define TF_CUDA_VERSION "12.0"
+#define TF_CUDA_VERSION "12.4"
 #define TF_CUDNN_VERSION "9"
 #define TF_CUDART_VERSION "12"
 #define TF_CUPTI_VERSION "12"
@@ -3541,9 +3601,8 @@ echo ">>> Buscando e injetando headers do cuDNN..."
 CUDNN_H=$(find /usr /opt $CONDA_PREFIX -name "cudnn_version.h" 2>/dev/null | head -n 1)
 
 if [ -z "$CUDNN_H" ]; then
-    echo ">>> cuDNN não encontrado! Instalando via Conda..."
-    conda install -c conda-forge cudnn -y
-    CUDNN_H=$(find $CONDA_PREFIX -name "cudnn_version.h" 2>/dev/null | head -n 1)
+    echo ">>> ERRO: cuDNN 9 nao encontrado. Deveria ter sido instalado no setup inicial."
+    exit 1
 fi
 
 if [ ! -z "$CUDNN_H" ]; then
@@ -3567,7 +3626,7 @@ echo ">>> Gerando cuda_config.h manualmente na sandbox do GCC..."
 cat > /tmp/cuda_config.h << 'CFGEOF'
 #ifndef CUDA_CUDA_CONFIG_H_
 #define CUDA_CUDA_CONFIG_H_
-#define TF_CUDA_VERSION "12.0"
+#define TF_CUDA_VERSION "12.4"
 #define TF_CUDNN_VERSION "9"
 #define TF_CUDART_VERSION "12"
 #define TF_CUPTI_VERSION "12"
@@ -3652,18 +3711,26 @@ sed -i '/use-gold-linker/d' .tf_configure.bazelrc 2>/dev/null || true
 #
 # LLD aceita melhor as relocacoes que BFD em libs grandes. O patcher v6
 # (patch_nv_toc_save.py, invocado apos pip install) cobre o bug ABI PPC64LE
-# que sobra: GCC nao emite `std r2, 24(r1)` em alguns __nv_* callbacks
-# gerados por NVCC, entao LLD insere stubs __long_branch_* inter-TOC que
-# corrompem r2. O patcher injeta wrappers (`std r2,24(r1); b stub`) em
+# que sobra: nem GCC nem Clang emitem `std r2, 24(r1)` em calls intra-.so
+# (correto pelo ELFv2 ABI), mas LLD insere stubs __long_branch_* inter-TOC
+# que corrompem r2. O patcher injeta wrappers (`std r2,24(r1); b stub`) em
 # 16 bytes de zero padding apos cada stub cuda + bls diretas a __cuda*/__nv*
 # em funcoes sem prologue save.
 #
 # Estado validado: TF importa + 2x V100 detectadas via list_physical_devices.
 # Matmul GPU pode ainda crashar em outras chains nao cobertas (bug
 # arquitetural GCC/NVCC, requer fix upstream).
-BAZEL_FUSE_LD="lld"
+# Use o LLD patchado (com fix do r2 TOC save) se disponível, senão conda LLD.
+PATCHED_LLD="$HOME/tensorflow_gpu/llvm-install/bin/ld.lld"
+if [ -x "$PATCHED_LLD" ]; then
+    BAZEL_FUSE_LD="$PATCHED_LLD"
+    export LD_LIBRARY_PATH="$HOME/tensorflow_gpu/llvm-install/lib:${LD_LIBRARY_PATH:-}"
+    echo ">>> Usando LLD PATCHADO (com fix multi-TOC r2 save): $PATCHED_LLD"
+else
+    BAZEL_FUSE_LD="lld"
+    echo ">>> Usando LLD do Conda (sem fix r2). Patcher v6 será aplicado."
+fi
 echo ">>> Linker selecionado para Bazel: -fuse-ld=${BAZEL_FUSE_LD}"
-echo ">>> LLD + patcher v6 (patch_nv_toc_save.py aplicado apos pip install)"
 
 # ----------------------------------------------------------------------------
 # LLD nao auto-gera os stubs _savefpr_NN/_restfpr_NN/_savevr_NN/_restvr_NN/
@@ -3675,7 +3742,7 @@ echo ">>> LLD + patcher v6 (patch_nv_toc_save.py aplicado apos pip install)"
 # Com BFD (atual), esse bloco eh dispensavel mas mantemos para o caso de
 # voltar para LLD. Pulamos a geracao se BAZEL_FUSE_LD nao for lld.
 # ----------------------------------------------------------------------------
-if [ "$BAZEL_FUSE_LD" = "lld" ]; then
+if [[ "$BAZEL_FUSE_LD" == *lld* ]]; then
 SAVRES_DIR=$HOME/ppc64_savres
 mkdir -p "$SAVRES_DIR"
 cat > "$SAVRES_DIR/savres.S" << 'SAVRES_ASM'
@@ -3856,11 +3923,20 @@ fi
 bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --config=cuda \
     --features=-start_end_lib \
+    --features=-header_modules \
+    --features=-use_header_modules \
+    --features=-module_maps \
+    --features=-layering_check \
+    --host_features=-header_modules \
+    --host_features=-use_header_modules \
+    --host_features=-module_maps \
+    --host_features=-layering_check \
     --@rules_ml_toolchain//common:enable_cuda=True \
     --repo_env=TF_NEED_CUDA=1 \
     --define=using_cuda_nvcc=true \
     --action_env=CC=$HOME/gcc_cuda_wrapper.sh \
     --action_env=GCC_HOST_COMPILER_PATH=$HOME/gcc_cuda_wrapper.sh \
+    --action_env=LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$HOME/cuda_unified/lib64 \
     --define=tflite_with_xnnpack=false \
     --local_ram_resources=HOST_RAM*.6 \
     --per_file_copt=".*cub_sort_kernel.*@-O0" \
@@ -3875,8 +3951,6 @@ bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --copt=-DPYBIND11_MODULE_LOCAL="" \
     --copt=-mcmodel=medium \
     --cxxopt=-mcmodel=medium \
-    --cxxopt=-D_Alignof=alignof \
-    --host_cxxopt=-D_Alignof=alignof \
     --linkopt=-fuse-ld=${BAZEL_FUSE_LD} \
     --host_linkopt=-fuse-ld=${BAZEL_FUSE_LD} \
     --linkopt=-Wl,-z,notext \
@@ -3890,6 +3964,7 @@ bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --host_linkopt=-Wl,--allow-shlib-undefined \
     --linkopt=-static-libgcc \
     --host_linkopt=-static-libgcc \
+    --host_linkopt=-Wl,-rpath,$CONDA_PREFIX/lib \
     "${SAVRES_LINKOPTS[@]}" \
     --extra_toolchains=@@local_config_python//:py_cc_toolchain \
     --override_repository=rules_ml_toolchain=$HOME/rules_ml_toolchain_patched \
@@ -4087,17 +4162,20 @@ echo ">>> Wheel blindado e vacinado com sucesso!"
 cd ~
 python3 -m pip install --force-reinstall --no-deps "$WHL_FILE"
 
-conda install -c conda-forge "h5py>=3.11,<3.15" grpcio libclang ml_dtypes "protobuf>=6.31.1,<8.0.0" libstdcxx-ng cudnn -y
+conda install -c conda-forge "h5py>=3.11,<3.15" grpcio libclang ml_dtypes "protobuf>=6.31.1,<8.0.0" libstdcxx-ng -y
+# NOTA: cudnn removido aqui propositalmente. Usamos cuDNN 9.0.0 ppc64le da
+# NVIDIA (baixado no setup inicial), nao o 8.9.7 do conda-forge.
 python3 -m pip install absl-py astunparse flatbuffers gast google-pasta keras opt-einsum termcolor wrapt
 
 # -----------------------------------------------------------------------------
-# Patch ABI PPC64LE (v6): insere `std r2, 24(r1)` que GCC omitiu em funcoes que
-# chamam CUDA library trampolines (cudart_stub.cc et al).
+# Patch ABI PPC64LE (v6): insere `std r2, 24(r1)` que o compilador (GCC/Clang)
+# omitiu em funcoes que chamam CUDA library trampolines.
 #
-# Causa raiz:
+# Causa raiz (ABI ELFv2, NAO e bug de compilador):
 # - Libs grandes (>64KB TOC) forcam LLD a usar multi-TOC.
-# - GCC ELFv2 nem sempre emite `std r2, 24(r1)` em prologos antes de bls a
-#   simbolos same-`.so` (assume intra-TOC).
+# - ELFv2 ABI especifica que calls intra-.so NAO precisam salvar r2.
+# - Portanto nem GCC nem Clang emitem `std r2, 24(r1)` antes de bls a
+#   simbolos same-`.so` (correto pelo ABI, assume intra-TOC).
 # - Os targets (trampolines `cudart_stub.cc` etc.) tem global entry prologue
 #   que troca r2 ao serem chamados.
 # - Sem o save, o `ld r2, 24(r1)` que LLD patcha apos cada bl le memoria de
@@ -4275,6 +4353,9 @@ def main():
             if tgt in stub2wrap:
                 struct.pack_into("<I", td, off, encode_bl(stub2wrap[tgt] - src))
                 bls_p += 1; need_nop = True
+            elif tgt in cuda_stubs:
+                # LLD patchado: thunk já tem std r2,24(r1), só precisa do restore
+                need_nop = True
             elif tgt in wrap_set:
                 need_nop = True
             elif tgt in cudart_func_addrs:
@@ -4340,16 +4421,16 @@ if [ ! -e "$CONDA_PREFIX/lib/libcudnn.so" ]; then
     fi
 fi
 
-# Bug do TensorFlow/Bazel: ele procura por cuDNN versão 9 (ou 12 dependendo da flag), 
-# então nós enganamos o TF fazendo os arquivos da versão .9 apontarem para a .8
-echo ">>> Aplicando patch de versão do cuDNN completo (v8 -> v9)..."
-ln -sf $CONDA_PREFIX/lib/libcudnn.so.8 $HOME/cuda_unified/lib64/libcudnn.so.9 2>/dev/null
-ln -sf $CONDA_PREFIX/lib/libcudnn_ops_infer.so.8 $HOME/cuda_unified/lib64/libcudnn_ops_infer.so.9 2>/dev/null
-ln -sf $CONDA_PREFIX/lib/libcudnn_cnn_infer.so.8 $HOME/cuda_unified/lib64/libcudnn_cnn_infer.so.9 2>/dev/null
-ln -sf $CONDA_PREFIX/lib/libcudnn_cnn_train.so.8 $HOME/cuda_unified/lib64/libcudnn_cnn_train.so.9 2>/dev/null
-ln -sf $CONDA_PREFIX/lib/libcudnn_ops_train.so.8 $HOME/cuda_unified/lib64/libcudnn_ops_train.so.9 2>/dev/null
-ln -sf $CONDA_PREFIX/lib/libcudnn_adv_infer.so.8 $HOME/cuda_unified/lib64/libcudnn_adv_infer.so.9 2>/dev/null
-ln -sf $CONDA_PREFIX/lib/libcudnn_adv_train.so.8 $HOME/cuda_unified/lib64/libcudnn_adv_train.so.9 2>/dev/null
+# cuDNN 9 real instalado via tarball da NVIDIA (cudnn-linux-ppc64le-9.0.0.312_cuda12).
+# Copiamos as .so.9 reais do $CONDA_PREFIX/lib para cuda_unified/lib64.
+# cuDNN 9 mudou os nomes das bibliotecas em relação ao v8:
+#   v8: libcudnn_ops_infer.so.8, libcudnn_cnn_infer.so.8, etc.
+#   v9: libcudnn_ops.so.9, libcudnn_cnn.so.9, libcudnn_graph.so.9, etc.
+echo ">>> Linkando cuDNN 9 real no cuda_unified..."
+for cudnn_lib in $CONDA_PREFIX/lib/libcudnn*.so*; do
+    [ -e "$cudnn_lib" ] || continue
+    ln -sf "$cudnn_lib" "$HOME/cuda_unified/lib64/$(basename $cudnn_lib)" 2>/dev/null
+done
 
 # GCC 8 do sistema não tem GLIBCXX_3.4.29 (requerido pelo NumPy do Conda).
 # Usa o libstdc++ do Conda que é mais novo.
