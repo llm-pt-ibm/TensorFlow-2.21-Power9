@@ -9,6 +9,42 @@
 # Usage:
 #   ./build_patched_lld.sh          # Build on Power9
 #   ./build_patched_lld.sh --test   # Build + run lit tests
+#
+# =============================================================================
+# PATCH STATUS / UPSTREAMABILITY
+# =============================================================================
+# This script applies 4 patches to LLVM/lld. Their nature differs:
+#
+#   [1] PPC64LongBranchThunk size 32 -> 36 bytes
+#   [2] PPC64LongBranchThunk::writeTo prefixes `std r2, 24(r1)`
+#       --- CORE FIX (upstreamable). Genuine bug in LLD's PPC64LE backend.
+#       Upstream LLD assumes intra-module bls never cross TOC boundaries.
+#       In multi-TOC mode (libs with >64KB TOC, e.g. libtensorflow_framework.so
+#       ~67MB .text), LongBranchThunks DO cross TOC groups and silently clobber
+#       caller's r2. Fix: thunk saves caller r2 before branching.
+#       Could be submitted as MR with refinement to only activate in multi-TOC.
+#
+#   [3] PPC64LongBranchThunk::addSymbols sets needsTocRestore(true)
+#       --- OVER-BROAD WORKAROUND (not upstreamable as-is). Marks ALL
+#       LongBranchThunks as requiring r2 restore. Correct for thunks created
+#       in multi-TOC mode (callee may have clobbered r2), but unnecessary for
+#       leaf functions like libgcc `_savegpr0_NN` -> false-positives in [4].
+#       Proper upstream fix: only set when target may clobber r2 (e.g. has
+#       global entry or localentry=1) AND multi-TOC mode is active.
+#
+#   [4] Replace "lacks nop, can't restore toc" Err(ctx) with (void)0
+#       --- TF-SPECIFIC WORKAROUND (do NOT upstream). Suppresses a legitimate
+#       ABI-violation diagnostic. Needed only because [3] is over-broad and
+#       triggers the error on libgcc/legacy code that doesn't expect r2 restore.
+#       For a clean general-purpose LLD ppc64le release, [3] should be refined
+#       so [4] becomes unnecessary.
+#
+# VERDICT for general distribution:
+#   - For TensorFlow build on PPC64LE: this build is correct and sufficient.
+#   - As a general PPC64LE LLD release: NOT recommended. Refine [3] first.
+#   - As reference for an upstream LLVM MR: patches [1]+[2] are the core
+#     contribution; [3]+[4] should be replaced by conditional logic.
+# =============================================================================
 
 set -o pipefail
 
@@ -39,28 +75,38 @@ fi
 
 echo "=== [2/5] Applying patch ==="
 cd "$LLVM_SRC"
-# Reset any previous attempts
+# Reset any previous attempts (both files we modify)
 git checkout -- lld/ELF/Thunks.cpp 2>/dev/null || true
+git checkout -- lld/ELF/Arch/PPC64.cpp 2>/dev/null || true
 
 # Apply the actual code changes (not the git-formatted patch, do it manually)
 echo "    -> Patching lld/ELF/Thunks.cpp..."
 
-# 1. Change size from 32 to 36
+# --- Patch [1] CORE FIX (upstreamable) ---
+# Change PPC64LongBranchThunk size from 32 to 36 to make room for the std r2.
 sed -i 's/uint32_t size() override { return 32; }/uint32_t size() override { return 36; }/' \
     lld/ELF/Thunks.cpp
 
-# 2. Add std r2,24(r1) before writePPC64LoadAndBranch in PPC64LongBranchThunk::writeTo
+# --- Patch [2] CORE FIX (upstreamable) ---
+# Add std r2,24(r1) before writePPC64LoadAndBranch in PPC64LongBranchThunk::writeTo.
+# Genuine bug fix: upstream LLD never emits this, breaking multi-TOC libs where
+# the thunk crosses TOC groups and clobbers caller's r2.
 sed -i '/^void PPC64LongBranchThunk::writeTo/,/^}/ {
     s|writePPC64LoadAndBranch(ctx, buf, offset);|// Save caller TOC pointer for multi-TOC correctness.\n  write32(ctx, buf + 0, 0xf8410018); // std r2, 24(r1)\n  writePPC64LoadAndBranch(ctx, buf + 4, offset);|
 }' lld/ELF/Thunks.cpp
 
-# 3. Reactivate needsTocRestore for LLD to automatically patch NOPs
+# --- Patch [3] OVER-BROAD WORKAROUND (refine before upstreaming) ---
+# Set needsTocRestore on every LongBranchThunk so LLD patches the trailing nop
+# to `ld r2, 24(r1)`. Correct for thunks crossing TOC, but unnecessary (and
+# false-positive-prone) for leaf-style callees like libgcc _savegpr0_NN.
+# Upstream-quality fix: gate this on `mayClobberCallerToc(destination)`.
 sed -i '/^void PPC64LongBranchThunk::addSymbols/,/^}/ {
     s|addSymbol(ctx.saver.save("__long_branch_" + destination.getName()), STT_FUNC,|Defined *s = addSymbol(ctx.saver.save("__long_branch_" + destination.getName()), STT_FUNC,|
     s|0, isec);|0, isec);\n  s->setNeedsTocRestore(true);|
 }' lld/ELF/Thunks.cpp
 
-# 4. Demote the "lacks nop" error to a no-op so LLD doesn't abort.
+# --- Patch [4] TF-SPECIFIC WORKAROUND (do NOT upstream) ---
+# Demote the "lacks nop" error to a no-op so LLD doesn't abort.
 # Some legitimately-missing nops (libgcc _savegpr0_NN, NVCC-generated code that
 # manually does ld r2,24(r1)) trigger this error. Replace the multi-line
 # `Err(ctx) << ...;` statement with a benign expression.
@@ -116,7 +162,29 @@ echo "=== [4/5] Building LLD ==="
 ninja lld
 
 echo "=== [5/5] Installing ==="
-ninja install-lld
+# 'install-lld' instala SO o componente lld (bin + libs principais), MAS com
+# BUILD_SHARED_LIBS=ON as deps LLVM (libLLVMSupport.so etc.) ficam fora.
+# 'install' instala TUDO no INSTALL_PREFIX, garantindo que as libs
+# correspondam ao ld.lld -> sem desync de "lacks nop" ainda na liblldELF antiga.
+ninja install
+
+# Verificacao final: bin e libs principais
+echo ""
+echo "=== Verificacao pos-install ==="
+ls -la "$INSTALL_DIR/bin/ld.lld" "$INSTALL_DIR/bin/lld" 2>/dev/null || true
+echo ">>> Procurando 'lacks nop' nos binarios instalados:"
+LEFTOVER=0
+for F in $(find "$INSTALL_DIR/bin" "$INSTALL_DIR/lib" -type f 2>/dev/null); do
+    if grep -aoq "lacks nop" "$F" 2>/dev/null; then
+        echo "  AINDA presente em: $F"
+        LEFTOVER=1
+    fi
+done
+if [ "$LEFTOVER" = "0" ]; then
+    echo "  OK: 'lacks nop' removido de todos os binarios instalados."
+else
+    echo "  AVISO: 'lacks nop' ainda aparece - patch python pode ter falhado."
+fi
 
 echo ""
 echo "============================================="
@@ -126,8 +194,6 @@ echo ""
 echo " Para usar no build do TensorFlow:"
 echo "   export BAZEL_FUSE_LD=$INSTALL_DIR/bin/ld.lld"
 echo "   --linkopt=-fuse-ld=$INSTALL_DIR/bin/ld.lld"
-echo ""
-echo " Se funcionar, o patcher v6 pode ser REMOVIDO!"
 echo "============================================="
 
 if [ "${1:-}" = "--test" ]; then

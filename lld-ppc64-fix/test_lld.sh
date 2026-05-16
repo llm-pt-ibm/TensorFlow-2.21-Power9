@@ -272,8 +272,15 @@ echo ""
 # ============================================================
 # T4: bl without trailing nop survives
 # ============================================================
-echo "=== T4 prep: grep -a 'lacks nop' in LLD binary ==="
-if grep -ao "lacks nop[^\"]*" "$LLD" 2>/dev/null | head -3; then :; fi
+echo "=== T4 prep: grep -a 'lacks nop' in LLD bin + libs ==="
+# "lacks nop" vive em liblldELF.so (BUILD_SHARED_LIBS=ON), nao em ld.lld.
+LLD_DIR=$(dirname "$LLD")
+LLD_PARENT=$(dirname "$LLD_DIR")
+for F in "$LLD" "$LLD_PARENT/lib"/lib*ELF*.so* "$LLD_PARENT/lib"/lib*Common*.so*; do
+    [ -f "$F" ] || continue
+    N=$(grep -aoc "lacks nop" "$F" 2>/dev/null)
+    [ "$N" -gt 0 ] && echo "  $F: $N hit(s)"
+done
 echo ""
 echo "=== T4: bl without trailing nop survives ==="
 TD=$(mktemp -d); cd "$TD"

@@ -2184,11 +2184,15 @@ else
 fi
 GCC_FORCE_LD="-B$REAL_LD_DIR"
 
+# NOTE: NAO reescrever .localentry $sym, N -> 0.
+# REAL_GCC=clang (linha acima) aceita corretamente `.localentry sym, 1`
+# (flag PPC64 ELFv2 ABI v1.5+ "CLOBBERS_R2"), produzindo stOther=0x20.
+# Isso permite que o LLD patcheado crie PPC64R2SaveStub para bls a esses
+# simbolos (ex.: trampolines do Implib.so/cudart_stub) e patche o nop apos
+# o bl para `ld r2, 24(r1)`. Reescrever a flag para 0 mata essa cadeia
+# e e a causa raiz do crash r2 em __sti____cudaRegisterAll no TF.
 clean_asm() {
-    if [[ "$1" == *.S || "$1" == *.s ]] && [ -f "$1" ]; then
-        chmod u+w "$1" 2>/dev/null || true
-        sed -i -E 's/(\.localentry\s+[^,]+,)\s*[0-9]+\b/\1 0/g' "$1" 2>/dev/null || true
-    fi
+    : # no-op
 }
 
 for arg in "$@"; do
@@ -2460,11 +2464,15 @@ else
 fi
 GCC_FORCE_LD="-B$REAL_LD_DIR"
 
+# NOTE: NAO reescrever .localentry $sym, N -> 0.
+# REAL_GCC=clang (linha acima) aceita corretamente `.localentry sym, 1`
+# (flag PPC64 ELFv2 ABI v1.5+ "CLOBBERS_R2"), produzindo stOther=0x20.
+# Isso permite que o LLD patcheado crie PPC64R2SaveStub para bls a esses
+# simbolos (ex.: trampolines do Implib.so/cudart_stub) e patche o nop apos
+# o bl para `ld r2, 24(r1)`. Reescrever a flag para 0 mata essa cadeia
+# e e a causa raiz do crash r2 em __sti____cudaRegisterAll no TF.
 clean_asm() {
-    if [[ "$1" == *.S || "$1" == *.s ]] && [ -f "$1" ]; then
-        chmod u+w "$1" 2>/dev/null || true
-        sed -i -E 's/(\.localentry\s+[^,]+,)\s*[0-9]+\b/\1 0/g' "$1" 2>/dev/null || true
-    fi
+    : # no-op
 }
 
 for arg in "$@"; do
@@ -4191,6 +4199,13 @@ python3 -m pip install absl-py astunparse flatbuffers gast google-pasta keras op
 #    prologo, instala wrapper em padding disponivel dentro de range +-32MB.
 # Idempotente.
 # -----------------------------------------------------------------------------
+# Com clean_asm() agora no-op, o Clang preserva `.localentry sym, 1` nos .S
+# do Implib.so. LLD pacheado ve a flag, cria PPC64R2SaveStub e patcha o nop
+# apos bl em `ld r2,24(r1)`. Logo o patcher binario pos-link e REDUNDANTE.
+# Mantido como safety net, desabilitavel via SKIP_PATCHER_V6=1.
+if [ "${SKIP_PATCHER_V6:-0}" = "1" ]; then
+    echo ">>> SKIP_PATCHER_V6=1: pulando patcher binario v6 (fix arquitetural via Clang+LLD ja aplicado)"
+else
 echo ">>> Aplicando patch ABI PPC64LE v6 (std r2 ausente em callers de cuda libs)..."
 python3 -c 'import elftools' 2>/dev/null || python3 -m pip install -q pyelftools
 
@@ -4406,6 +4421,7 @@ else
         fi
     done
 fi
+fi  # fim do SKIP_PATCHER_V6 else-branch
 
 # Criar symlinks do cuDNN no cuda_unified (onde o TF busca libs CUDA)
 echo ">>> Linkando cuDNN no cuda_unified..."
