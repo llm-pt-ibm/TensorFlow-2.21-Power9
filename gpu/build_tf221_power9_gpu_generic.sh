@@ -1,4 +1,31 @@
 #!/bin/bash
+# ============================================================================
+# TensorFlow 2.21 build for PPC64LE + NVIDIA V100. See README.md for context.
+#
+# Architectural decisions specific to PPC64LE:
+#
+#   1. Linker: patched LLD (lld-ppc64-fix/) with r2-save in LongBranchThunks
+#      and 'lacks nop' error suppressed for libgcc compat.
+#
+#   2. Host assembler: Clang from conda env (gcc_cuda_wrapper.sh redirects to
+#      it). GAS 2.30 rejects `.localentry sym, 1` which Implib.so trampolines
+#      need; Clang accepts it. We do NOT rewrite this directive (clean_asm
+#      is a no-op).
+#
+#   3. cuDNN 9 headers are forcibly copied over the conda-forge 8.9.7 headers
+#      in 5 Bazel-visible paths.
+#
+#   4. MLIR generated GPU kernels are DISABLED via
+#        --//tensorflow/core/kernels/mlir_generated:enable_gpu=False
+#      because hlo_to_kernel (the MLIR->PTX tool) segfaults in the LLVM NVPTX
+#      backend when run on a PPC64LE host. The classical C++ template path
+#      (REGISTER3 macros) is used instead — no functional loss.
+#
+#   5. _savefpr_NN / _restfpr_NN PPC64 helper stubs are auto-generated into
+#      libppc64_savres.a and force-linked (LLD does not synthesize them).
+#
+# See README.md "Known Limitations" for details.
+# ============================================================================
 
 set -eo pipefail
 
@@ -3985,6 +4012,7 @@ bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --@rules_ml_toolchain//common:enable_cuda=True \
     --repo_env=TF_NEED_CUDA=1 \
     --define=using_cuda_nvcc=true \
+    --//tensorflow/core/kernels/mlir_generated:enable_gpu=False \
     --action_env=CC=$HOME/gcc_cuda_wrapper.sh \
     --action_env=GCC_HOST_COMPILER_PATH=$HOME/gcc_cuda_wrapper.sh \
     --action_env=LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$HOME/cuda_unified/lib64 \

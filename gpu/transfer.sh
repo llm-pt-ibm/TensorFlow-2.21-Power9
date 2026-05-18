@@ -1,45 +1,52 @@
 #!/bin/bash
-# Invalidar TODOS .o que dependem de cudnn + .so finais, depois rodar build + testes
+# Tentar --jit=true, --mlir-print-ir-before-all p/ ver onde trava
 
 set -o pipefail
 source /root/miniforge3/etc/profile.d/conda.sh
 conda activate tf221_build || conda activate base || true
 
 CACHE_BASE=/root/.cache/bazel/_bazel_root/cfc10a9bac1c788901c46f30aa7da373/execroot/org_tensorflow
+TF_BUILD=$HOME/tensorflow_gpu/tf221_workspace/tensorflow
+HLO=$CACHE_BASE/bazel-out/ppc-opt/bin/tensorflow/compiler/mlir/tools/kernel_gen/hlo_to_kernel
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$HOME/cuda_unified/lib64"
+export MLIR_CRASH_REPRODUCER_DIRECTORY=/tmp
 
-echo "=== [1] Invalidar TODOS .o com dep em cudnn headers ==="
-COUNT=0
-for D in $(find "$CACHE_BASE/bazel-out" -name "*.d" 2>/dev/null); do
-    if grep -q "cudnn" "$D" 2>/dev/null; then
-        O="${D%.d}.o"
-        if [ -f "$O" ]; then
-            rm -f "$O" "$D"
-            COUNT=$((COUNT+1))
-        fi
-    fi
-done
-echo "  $COUNT pares .o/.d deletados"
+TMPL="$TF_BUILD/tensorflow/core/kernels/mlir_generated/op_definitions/add_v2.mlir.tmpl"
+MLIR=/tmp/add_v2_f32.mlir
+sed 's/platform/gpu/g; s/elem_type/f32/g; s/output_type/f32/g' "$TMPL" > "$MLIR"
+
+echo "=== [A] Tentar --jit=true (compila em runtime, sem PTX agora) ==="
+OUT=/tmp/add_v2_jit.o
+rm -f "$OUT"
+LOG=/tmp/hlo_jit_$(date +%H%M%S).log
+echo "  log: $LOG"
+timeout 60 "$HLO" \
+    --tile_sizes=256 --host-triple=powerpc64le-linux-gnu --arch=sm_70 \
+    --input="$MLIR" --output="$OUT" \
+    --enable_ftz=true --jit_i64_indexed_for_large_tensors=false \
+    --jit=true 2>&1 | tee "$LOG" | head -40 | sed 's/^/    /'
+RC=$?
+echo ""
+echo "  exit $RC ($([ $RC -eq 124 ] && echo TIMEOUT))"
+[ -f "$OUT" ] && echo "  output: $(stat -c %s $OUT) bytes" || echo "  no output"
 echo ""
 
-echo "=== [2] Deletar .so finais (forca relink) ==="
-find "$CACHE_BASE/bazel-out" -type f \( \
-    -name "libtensorflow_framework.so*" -o \
-    -name "libtensorflow_cc.so*" -o \
-    -name "_pywrap_*.so" -o \
-    -name "lib_pywrap_*.so" \
-\) -delete 2>/dev/null
-echo "  .so principais deletadas"
+echo "=== [B] Tentar --mlir-print-ir-before-all + --mlir-disable-threading 30s ==="
+LOG=/tmp/hlo_verbose_$(date +%H%M%S).log
+echo "  log: $LOG"
+timeout 30 "$HLO" \
+    --tile_sizes=256 --host-triple=powerpc64le-linux-gnu --arch=sm_70 \
+    --input="$MLIR" --output=/tmp/test.o \
+    --enable_ftz=true --jit_i64_indexed_for_large_tensors=false --jit=false \
+    --mlir-disable-threading \
+    --mlir-print-ir-before-all 2>&1 | tee "$LOG" > /dev/null
+RC=$?
+echo "  exit $RC"
+echo ""
+echo "  Ultimas 30 linhas do log (provavelmente mostra a pass onde travou):"
+tail -30 "$LOG" 2>/dev/null | sed 's/^/    /'
 echo ""
 
-echo "=== [3] Build + Testes ==="
-BUILD_SCRIPT="$HOME/tensorflow_gpu/tensorflow_gpu.sh"
-TESTS="$HOME/tensorflow_gpu/gpu_tests.py"
-LOG="/tmp/tf_build_$(date +%Y%m%d_%H%M%S).log"
-
-bash "$BUILD_SCRIPT" 2>&1 | tee "$LOG"
-RC=${PIPESTATUS[0]}
-echo ""
-echo "Build rc=$RC | log: $LOG"
-[ $RC -ne 0 ] && exit $RC
-
-python3 "$TESTS"
+echo "=== [C] Reprod files gerados? ==="
+ls -la /tmp/*.mlir 2>/dev/null | grep -v "add_v2_f32.mlir" | head -5 | sed 's/^/    /'
+ls -la /tmp/mlir_reproducer* 2>/dev/null | head -5 | sed 's/^/    /'
