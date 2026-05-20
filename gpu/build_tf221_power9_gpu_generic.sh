@@ -44,18 +44,56 @@ echo "========================================="
 mkdir -p "$TF_BUILD_DIR"
 
 if [ ! -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
-    echo "ERRO: O Conda (miniforge/anaconda) nao foi encontrado em $CONDA_BASE."
-    echo "Por favor, altere o script atualizando a variavel CONDA_BASE para o local correto, ou instale o Miniforge3."
-    exit 1
+    echo ">>> Miniforge3 nao encontrado em $CONDA_BASE. Iniciando instalacao automatica..."
+    ARCH=$(uname -m)
+    echo ">>> Arquitetura detectada: $ARCH"
+    
+    MINIFORGE_URL=""
+    if [ "$ARCH" = "x86_64" ]; then
+        MINIFORGE_URL="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
+    elif [ "$ARCH" = "ppc64le" ]; then
+        MINIFORGE_URL="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-ppc64le.sh"
+    elif [ "$ARCH" = "aarch64" ]; then
+        MINIFORGE_URL="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh"
+    fi
+
+    if [ -z "$MINIFORGE_URL" ]; then
+        echo "ERRO: Arquitetura $ARCH nao e' suportada para instalacao automatica do Miniforge3."
+        echo "Instale o Miniforge3 manualmente e aponte CONDA_BASE para o local de instalacao."
+        exit 1
+    fi
+
+    echo ">>> Baixando Miniforge3..."
+    wget -qO /tmp/Miniforge3.sh "$MINIFORGE_URL" || curl -L -o /tmp/Miniforge3.sh "$MINIFORGE_URL"
+    
+    echo ">>> Instalando Miniforge3 silenciosamente em $CONDA_BASE..."
+    bash /tmp/Miniforge3.sh -b -p "$CONDA_BASE"
+    rm -f /tmp/Miniforge3.sh
+
+    if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+        echo ">>> Miniforge3 instalado com sucesso em $CONDA_BASE!"
+    else
+        echo "ERRO: Falha ao instalar o Miniforge3."
+        exit 1
+    fi
 fi
 
 if ! command -v bazel &> /dev/null; then
-    echo "ERRO: O Bazel nÃ£o foi encontrado no PATH. VocÃª compilou/instalou o Bazel nesta nova VM?"
-    echo "O tutorial confia que o Bazel jÃ¡ estÃ¡ disponÃ­vel em /usr/local/bin ou no PATH."
+    echo "ERRO: O Bazel não foi encontrado no PATH. Você compilou/instalou o Bazel nesta nova VM?"
+    echo "O tutorial confia que o Bazel já está disponível em /usr/local/bin ou no PATH."
     exit 1
 fi
 
-dnf install -y git gcc gcc-c++ zip unzip which patch wget vim-common
+echo ">>> Verificando pacotes de sistema necessarios..."
+if command -v dnf &> /dev/null; then
+    dnf install -y git gcc gcc-c++ zip unzip which patch wget vim-common || echo "Aviso: Falha ao instalar pacotes via dnf. Continuando..."
+elif command -v apt-get &> /dev/null; then
+    apt-get update && apt-get install -y git gcc g++ zip unzip patch wget vim-common || echo "Aviso: Falha ao instalar pacotes via apt-get. Continuando..."
+elif command -v yum &> /dev/null; then
+    yum install -y git gcc gcc-c++ zip unzip which patch wget vim-common || echo "Aviso: Falha ao instalar pacotes via yum. Continuando..."
+else
+    echo "Aviso: Gerenciador de pacotes nao encontrado. Certifique-se de que git, gcc, g++, zip, unzip, patch, wget estao instalados."
+fi
 
 source $CONDA_BASE/etc/profile.d/conda.sh
 conda create -n tf221_build "python=3.11" numpy wheel packaging requests setuptools pip -c conda-forge -y || true
