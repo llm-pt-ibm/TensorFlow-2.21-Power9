@@ -66,6 +66,7 @@ If a future TF/LLVM/MLIR release fixes the NVPTX backend crash on PPC64LE hosts,
 
 - cuDNN 9.1+ does not ship ppc64le builds — we pin to 9.0.0.
 - XLA GPU JIT compiler is not registered (so `model.fit(..., jit_compile=True)` will fail with "could not find registered compiler"). The test suite uses `jit_compile=False` everywhere.
+- **NCCL stub separado (`cuda_nccl_stub`)** — `nccl_configure.bzl` lê `_nccl_version` de `@cuda_nccl//:version.bzl`. Se compartilhar `cuda_redist_stub` (que tem `VERSION = "12"` para CUDA major), TF emite `#define TF_NCCL_VERSION "12"` e tenta dlopen `libnccl.so.12` (inexistente) → Multi-GPU NCCL collectives falham com "NCCL: Unable to load NCCL library". O fix é criar um `cuda_nccl_stub` separado com `VERSION = "2"` e apontar `--override_repository=cuda_nccl=$HOME/cuda_nccl_stub` (já incorporado no build script). Resultado: TF dlopen `libnccl.so.2` (existe via symlink em `$CONDA_PREFIX/lib`) → NCCL funciona nativo.
 
 ## Repository layout
 

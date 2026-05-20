@@ -1,29 +1,41 @@
 #!/usr/bin/env python3
-"""TensorFlow GPU functional coverage suite for Power9 + V100.
+"""TensorFlow GPU functional coverage suite for Power9 + V100 (76 tests).
 
 Sections:
-  Core (T01-T12)              setup, device, memory, basic ops, matmul
-  Tensor ops (T13-T20)        creation, dtypes, shape, math, reduce, indexing
-  Linear algebra (T21-T26)    matmul flavors, inv/solve/det, decomp, einsum
-  Random (T27-T30)            distributions, stateless, seed reproducibility
-  NN layers (T31-T40)         activations, pooling, normalization, embedding,
-                              rnn cells, attention
-  Image / Signal (T41-T45)    resize/crop, color, ssim, FFT, conv1d
-  Sparse / Ragged / Strings   (T46-T48) sparse ops, ragged ops, strings
-  Data pipeline (T49-T52)     tf.data primitives + transforms
-  Vars / Opt / Loss (T53-T57) Variable, optimizers, losses
-  Keras models (T58-T63)      Sequential, Functional, save/load, callbacks
-  Grad / AutoDiff (T64-T67)   GradientTape, jacobian, stop_gradient
-  tf.function (T68-T70)       basic / signature / autograph
-  Persistence (T71-T72)       Checkpoint / SavedModel
-  Mixed precision (T73)       fp16 policy
-  Distribute (T74)            OneDeviceStrategy
-  Extras (T75)                tf.config / threading
+  Core (T01-T12)              setup, device, memory, basic ops, matmul,
+                              conv2d, backprop, train, LSTM, fp16,
+                              multi-GPU MirroredStrategy, stress
+  Tensor ops (T13-T20)        creation, dtypes, shape, math, reduce,
+                              indexing, pad, cast (strict-dtype check)
+  Linear algebra (T21-T26)    matmul flavors, inv/solve/det, SVD/QR/Cholesky,
+                              eigh, einsum, norm
+  Random (T27-T30)            distributions, shuffle/categorical, stateless,
+                              global seed reproducibility
+  NN layers (T31-T40)         activations, pooling, BatchNorm/LayerNorm/
+                              GroupNorm, Dropout, Embedding, RNN/GRU,
+                              Bidirectional LSTM, MultiHeadAttention,
+                              Conv1D/Conv3D/Conv2DTranspose
+  Image / Signal (T41-T45)    resize/crop, color, SSIM/PSNR, FFT/IFFT/RFFT,
+                              DCT/STFT
+  Sparse / Ragged / Strings   (T46-T48) SparseTensor, RaggedTensor, tf.strings
+  Data pipeline (T49-T52)     from_tensor_slices, batch/map/shuffle/repeat/
+                              prefetch, interleave, zip
+  Vars / Opt / Loss (T53-T57) Variable assign/scatter, SGD/Adam/RMSprop/
+                              Adagrad, losses, metrics, LR schedule
+  Keras models (T58-T63)      Functional API, multi-IO, Subclass,
+                              evaluate/predict, callbacks, model.save (.keras)
+  Grad / AutoDiff (T64-T67)   GradientTape, persistent, jacobian, stop_gradient
+  tf.function (T68-T70)       basic, input_signature, autograph control flow
+  Persistence (T71-T73)       Checkpoint, Keras save/load_model,
+                              tf.Module + saved_model (low-level)
+  Mixed precision (T74)       mixed_float16 policy
+  Distribute (T75)            OneDeviceStrategy
+  Extras (T76)                tf.config + threading
 
 Usage:
-  python3 gpu_test_suite.py              # all tests
-  python3 gpu_test_suite.py T05 T30      # only listed
-  python3 gpu_test_suite.py --quick      # skip stress + multi-gpu + heavy
+  python3 gpu_test_suite.py              # all 76 tests
+  python3 gpu_test_suite.py T05 T39 T75  # only listed
+  python3 gpu_test_suite.py --quick      # skip T11 multi-GPU + T12 stress
 """
 import os
 import re

@@ -116,6 +116,23 @@ rm -rf tensorflow
 git clone --depth 1 --branch v2.21.0 https://github.com/tensorflow/tensorflow.git
 cd tensorflow
 
+# --- PATCH: TF_NCCL_VERSION nao pode ser empty ---------------------------
+# Em hermetic mode com cuda_redist_stub vazio, nccl_configure.bzl cai num
+# fallback que escreve `#define TF_NCCL_VERSION ""`. Resultado: o
+# nccl_stub.cc chama GetDsoHandle("nccl", "") que via
+# FormatLibraryFileName produz um soname nao-resolvivel no RUNPATH do
+# libtensorflow_framework, e Multi-GPU collective ops abortam com
+# "NCCL: Unable to load NCCL library". Forcamos o fallback para "2" para
+# que TF tente libnccl.so.2 (que existe via symlink no $CONDA_PREFIX/lib).
+NCCL_BZL="third_party/xla/third_party/nccl/hermetic/nccl_configure.bzl"
+if [ -f "$NCCL_BZL" ]; then
+    sed -i 's|"#define TF_NCCL_VERSION \\"\\""|"#define TF_NCCL_VERSION \\"2\\""|g' \
+        "$NCCL_BZL"
+    echo ">>> NCCL: TF_NCCL_VERSION fallback patched empty -> \"2\""
+    grep -n "TF_NCCL_VERSION" "$NCCL_BZL" | head -5 | sed 's/^/    /'
+fi
+# -------------------------------------------------------------------------
+
 rm -f .bazelversion
 #bazel clean --expunge 2>/dev/null || true
 
@@ -386,6 +403,10 @@ EOF
 mkdir -p $HOME/cuda_redist_stub
 touch $HOME/cuda_redist_stub/WORKSPACE
 echo 'VERSION = "12"' > $HOME/cuda_redist_stub/version.bzl
+
+# cuda_nccl_stub: stub separado pro @cuda_nccl override com VERSION="2".
+# (Bloco completo, copia generica do cuda_redist_stub mas com VERSION="2".)
+# Criado depois que cuda_redist_stub esta completo (linha ~420+).
 cat > $HOME/cuda_redist_stub/versions.bzl << 'EOF'
 NVIDIA_WHEEL_VERSIONS = {
     "12": [],
@@ -424,6 +445,21 @@ filegroup(name = "cuobjdump", srcs = [], visibility = ["//visibility:public"])
 filegroup(name = "nvlink", srcs = [], visibility = ["//visibility:public"])
 filegroup(name = "nvdisasm", srcs = [], visibility = ["//visibility:public"])
 EOF
+
+# --- cuda_nccl_stub: stub separado APENAS para o @cuda_nccl override ---
+# nccl_configure.bzl le @cuda_nccl//:version.bzl como _nccl_version e usa
+# isso para o macro TF_NCCL_VERSION. Compartilhar cuda_redist_stub (que tem
+# VERSION="12" do CUDA major) faz TF gerar TF_NCCL_VERSION="12" e dlopen
+# libnccl.so.12 (inexistente). Stub separado com VERSION="2" produz
+# libnccl.so.2 (existe via symlink em $CONDA_PREFIX/lib).
+mkdir -p $HOME/cuda_nccl_stub
+touch $HOME/cuda_nccl_stub/WORKSPACE
+echo 'VERSION = "2"' > $HOME/cuda_nccl_stub/version.bzl
+cp $HOME/cuda_redist_stub/empty.c $HOME/cuda_nccl_stub/
+cp $HOME/cuda_redist_stub/empty.o $HOME/cuda_nccl_stub/
+cp $HOME/cuda_redist_stub/libdummy.a $HOME/cuda_redist_stub/libdummy.so $HOME/cuda_nccl_stub/
+cp $HOME/cuda_redist_stub/BUILD $HOME/cuda_nccl_stub/BUILD
+cp $HOME/cuda_redist_stub/versions.bzl $HOME/cuda_nccl_stub/versions.bzl
 
 # --- TensorRT stub ---
 mkdir -p $HOME/tensorrt_stub
@@ -1479,7 +1515,7 @@ BAZEL_OVERRIDE_FLAGS="\
     --override_repository=cuda_nvdisasm=$HOME/cuda_redist_stub \
     --override_repository=cuda_nvvm=$HOME/cuda_redist_stub \
     --override_repository=cuda_nvjitlink=$HOME/cuda_redist_stub \
-    --override_repository=cuda_nccl=$HOME/cuda_redist_stub \
+    --override_repository=cuda_nccl=$HOME/cuda_nccl_stub \
     --override_repository=cuda_nvrtc=$HOME/cuda_redist_stub \
     --override_repository=nvidia_wheel_versions=$HOME/cuda_redist_stub \
     --override_repository=tf_wheel_version_suffix=$HOME/tf_wheel_version_suffix_stub \
@@ -4079,7 +4115,7 @@ bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --override_repository=cuda_nvdisasm=$HOME/cuda_redist_stub \
     --override_repository=cuda_nvvm=$HOME/cuda_redist_stub \
     --override_repository=cuda_nvjitlink=$HOME/cuda_redist_stub \
-    --override_repository=cuda_nccl=$HOME/cuda_redist_stub \
+    --override_repository=cuda_nccl=$HOME/cuda_nccl_stub \
     --override_repository=cuda_nvrtc=$HOME/cuda_redist_stub \
     --override_repository=nvidia_wheel_versions=$HOME/cuda_redist_stub \
     --override_repository=pypi=$HOME/pypi_stub \
