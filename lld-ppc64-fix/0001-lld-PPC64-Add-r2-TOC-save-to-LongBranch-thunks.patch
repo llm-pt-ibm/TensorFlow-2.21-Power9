@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: TensorFlow-Power9 Team <tf-power9@example.com>
+Date: Wed, 14 May 2026 21:00:00 -0300
+Subject: [PATCH] [lld][PPC64] Add r2 TOC save to LongBranch thunks for
+ multi-TOC correctness
+
+When LLD creates PPC64LongBranchThunk entries for intra-object calls
+that exceed 26-bit branch offset range, it does not save the caller's
+TOC pointer (r2) before branching through the thunk. In multi-TOC
+scenarios (shared objects with .text > 64KB of TOC-relative data), the
+thunk may redirect through a different TOC group, causing r2 corruption.
+
+The existing PPC64PltCallStub and PPC64R2SaveStub both correctly save r2
+via `std r2, 24(r1)` before branching, and set needsTocRestore so the
+linker patches the post-call nop to `ld r2, 24(r1)`. LongBranch thunks
+lack this, causing:
+  1. The thunk clobbers r2 when switching TOC groups
+  2. The post-call nop is NOT patched to restore r2 (needsTocRestore
+     not set)
+  3. r2 remains corrupted -> crash on next TOC-relative access
+
+This manifests in large shared libraries like libtensorflow_framework.so
+(~67MB .text) on ppc64le, causing segfaults in __sti____cudaRegisterAll,
+PlatformInitialize, etc.
+
+Fix: Add `std r2, 24(r1)` to PPC64LongBranchThunk::writeTo() and set
+needsTocRestore on the thunk symbol, consistent with PPC64PltCallStub
+and PPC64R2SaveStub behavior.
+
+Differential Revision: (pending)
+---
+ lld/ELF/Thunks.cpp                              | 12 +++++++-----
+ lld/test/ELF/ppc64-long-branch-r2-save.s        | 70 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 77 insertions(+), 5 deletions(-)
+ create mode 100644 lld/test/ELF/ppc64-long-branch-r2-save.s
+
+diff --git a/lld/ELF/Thunks.cpp b/lld/ELF/Thunks.cpp
+index abcdef1234..567890abcd 100644
+--- a/lld/ELF/Thunks.cpp
++++ b/lld/ELF/Thunks.cpp
+@@ -567,7 +567,7 @@ class PPC64LongBranchThunk : public Thunk {
+ public:
+-  uint32_t size() override { return 32; }
++  uint32_t size() override { return 36; }
+   void writeTo(uint8_t *buf) override;
+   void addSymbols(ThunkSection &isec) override;
+   bool isCompatibleWith(const InputSection &isec,
+@@ -1518,9 +1518,11 @@ void PPC64R12SetupStub::addSymbols(ThunkSection &isec) {
+ void PPC64LongBranchThunk::writeTo(uint8_t *buf) {
+   int64_t offset =
+       ctx.in.ppc64LongBranchTarget->getEntryVA(&destination, addend) -
+       getPPC64TocBase(ctx);
+-  writePPC64LoadAndBranch(ctx, buf, offset);
++  // Save the caller's TOC pointer before branching. In multi-TOC
++  // scenarios, the thunk may redirect to a different TOC group.
++  write32(ctx, buf + 0, 0xf8410018); // std r2, 24(r1)
++  writePPC64LoadAndBranch(ctx, buf + 4, offset);
+ }
+
+ void PPC64LongBranchThunk::addSymbols(ThunkSection &isec) {
+-  addSymbol(ctx.saver.save("__long_branch_" + destination.getName()), STT_FUNC,
+-            0, isec);
++  Defined *s = addSymbol(
++      ctx.saver.save("__long_branch_" + destination.getName()), STT_FUNC, 0,
++      isec);
++  s->setNeedsTocRestore(true);
+ }
+
+diff --git a/lld/test/ELF/ppc64-long-branch-r2-save.s b/lld/test/ELF/ppc64-long-branch-r2-save.s
+new file mode 100644
+index 000000000..1234567890
+--- /dev/null
++++ b/lld/test/ELF/ppc64-long-branch-r2-save.s
+@@ -0,0 +1,70 @@
++# REQUIRES: ppc
++# RUN: llvm-mc -filetype=obj -triple=powerpc64le %s -o %t.o
++# RUN: ld.lld -shared %t.o -o %t.so
++# RUN: llvm-objdump -d --no-show-raw-insn %t.so | FileCheck %s
++
++## Test that PPC64 long branch thunks include std r2, 24(r1) to save the
++## TOC pointer before branching. This is needed for multi-TOC correctness:
++## when a shared library's .text exceeds the 26-bit branch offset range,
++## LLD creates long branch thunks that may redirect through different TOC
++## groups. Without the r2 save, the post-call ld r2, 24(r1) (patched from
++## nop by the linker) would restore garbage, corrupting the TOC pointer.
++
++## Place callee far enough away to force a long branch thunk.
++
++.section .text.caller, "ax", @progbits
++.globl caller
++.type caller, @function
++.p2align 4
++caller:
++.Lfunc_begin:
++  mflr 0
++  std 0, 16(r1)
++  stdu 1, -32(r1)
++  bl callee
++  nop
++  addi 1, 1, 32
++  ld 0, 16(r1)
++  mtlr 0
++  blr
++.Lfunc_end:
++  .size caller, .Lfunc_end - .Lfunc_begin
++
++## Insert 32MB of padding to force long branch.
++.section .text.pad, "ax", @progbits
++.space 0x2000000
++
++.section .text.callee, "ax", @progbits
++.globl callee
++.type callee, @function
++.p2align 4
++callee:
++.Lfunc_begin2:
++  ## Global entry point: set up TOC from r12
++  addis 2, 12, .TOC.-callee@ha
++  addi 2, 2, .TOC.-callee@l
++  .localentry callee, .-callee
++  ## Function body
++  li 3, 42
++  blr
++.Lfunc_end2:
++  .size callee, .Lfunc_end2 - .Lfunc_begin2
++
++## CHECK-LABEL: <__long_branch_callee>:
++## CHECK-NEXT:    std 2, 24(1)
++## CHECK-NEXT:    addis 12, 2,
++## CHECK-NEXT:    ld 12,
++## CHECK-NEXT:    mtctr 12
++## CHECK-NEXT:    bctr
++
++## Verify that the nop after bl in caller was patched to ld r2, 24(r1):
++## CHECK-LABEL: <caller>:
++## CHECK:         bl
++## CHECK-NEXT:    ld 2, 24(1)
+--
+2.43.0
