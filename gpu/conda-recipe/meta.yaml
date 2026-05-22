@@ -1,0 +1,48 @@
+package:
+  name: tensorflow-gpu
+  version: "2.21.0"
+
+source:
+  url: https://github.com/llm-pt-ibm/tensorflow/releases/download/v2.21.0-gpu/tensorflow-2.21.0-cp311-cp311-linux_ppc64le.whl
+
+build:
+  number: 0
+  script: pip install --no-deps $SRC_DIR/tensorflow-2.21.0-cp311-cp311-linux_ppc64le.whl
+
+requirements:
+  host:
+    - python =3.11
+    - pip
+  run:
+    - python >=3.11,<3.12
+    - numpy >=2.0.0
+    - grpcio
+    - h5py <3.15.0
+    - protobuf >=6.31.1,<8.0.0
+    - ml_dtypes
+    - libstdcxx-ng
+    - absl-py
+    - astunparse
+    - gast
+    - google-pasta
+    - keras >=2.0.0
+    - opt_einsum
+    - python-flatbuffers
+    - requests
+    - six
+    - termcolor
+    - typing_extensions
+    - wrapt
+    - libclang
+
+about:
+  home: https://github.com/llm-pt-ibm/tensorflow
+  license: Apache-2.0
+  summary: "TensorFlow 2.21.0 (GPU/CUDA) natively compiled for ppc64le (Power9 + V100)"
+  description: |
+    TensorFlow 2.21.0 built from source for IBM Power9 (ppc64le) with NVIDIA
+    GPU support (CUDA 12.4 + cuDNN 9.0.0). Tested on Tesla V100 (sm_70).
+
+    Requires CUDA 12.4 runtime and cuDNN 9 reachable via LD_LIBRARY_PATH
+    (not bundled in this package). See:
+    https://github.com/llm-pt-ibm/TensorFlow-2.21-Power9
