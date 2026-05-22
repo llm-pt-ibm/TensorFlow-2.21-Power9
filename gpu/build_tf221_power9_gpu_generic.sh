@@ -499,6 +499,57 @@ cp $HOME/cuda_redist_stub/libdummy.a $HOME/cuda_redist_stub/libdummy.so $HOME/cu
 cp $HOME/cuda_redist_stub/BUILD $HOME/cuda_nccl_stub/BUILD
 cp $HOME/cuda_redist_stub/versions.bzl $HOME/cuda_nccl_stub/versions.bzl
 
+# RAFT-ENABLE 2026-05-22: cuda_cccl_stub separado expondo Thrust + CUB +
+# libcudacxx (cuda/std) do CUDA 12.2 toolkit como header_list. Necessario pra
+# RMM/RAFT 25.08 acharem <thrust/detail/config.h>. Compartilhar cuda_redist_stub
+# (que tem header_list vazio) quebra o select_k_exec_raft.
+CCCL=$HOME/cuda_cccl_stub
+CUDA_TK_INC=/usr/local/cuda-12.2/targets/ppc64le-linux/include
+rm -rf $CCCL && mkdir -p $CCCL/include
+if [ -d "$CUDA_TK_INC/thrust" ]; then
+    cp -r $CUDA_TK_INC/thrust $CCCL/include/
+    cp -r $CUDA_TK_INC/cub    $CCCL/include/
+    cp -r $CUDA_TK_INC/cuda   $CCCL/include/
+    touch $CCCL/WORKSPACE
+    cat > $CCCL/BUILD << 'CCCL_BUILD'
+package(default_visibility = ["//visibility:public"])
+filegroup(
+    name = "header_list",
+    srcs = glob([
+        "include/**/*.h",
+        "include/**/*.hpp",
+        "include/**/*.cuh",
+        "include/**/*.inc",
+        "include/**/*",
+    ], exclude = [
+        "include/**/*.cmake",
+        "include/**/*.txt",
+        "include/**/CMakeLists.txt",
+    ], allow_empty = True),
+)
+cc_library(
+    name = "headers",
+    textual_hdrs = glob([
+        "include/**/*.h",
+        "include/**/*.hpp",
+        "include/**/*.cuh",
+        "include/**/*.inc",
+        "include/**/*",
+    ], exclude = [
+        "include/**/*.cmake",
+        "include/**/*.txt",
+        "include/**/CMakeLists.txt",
+    ], allow_empty = True),
+    includes = ["include"],
+)
+CCCL_BUILD
+    echo 'VERSION = "2.2.0"' > $CCCL/version.bzl
+    touch $CCCL/versions.bzl
+    echo ">>> cuda_cccl_stub criado em $CCCL (Thrust+CUB+libcudacxx do toolkit)"
+else
+    echo ">>> WARNING: $CUDA_TK_INC nao encontrado, cuda_cccl_stub vazio (RAFT vai falhar)"
+fi
+
 # --- TensorRT stub ---
 mkdir -p $HOME/tensorrt_stub
 touch $HOME/tensorrt_stub/WORKSPACE
@@ -949,21 +1000,31 @@ if [ -f "$HOME/local_config_cuda_stub/cuda/cuda_include/cupti.h" ]; then
 fi
 
 
-# Explicitly remove any native/broken version of CUB and Thrust copied from the host
+# RAFT-ENABLE 2026-05-22: usa Thrust/CUB/libcudacxx do CUDA 12.2 toolkit (2.x).
+# Antes usava Thrust/CUB 1.17.2 standalone, mas RMM/RAFT 25.08 exigem 2.x do CCCL bundle.
 rm -rf $HOME/local_config_cuda_stub/cuda/cuda_include/cub
 rm -rf $HOME/local_config_cuda_stub/cuda/cuda_include/thrust
 rm -rf $HOME/local_config_cuda_stub/cuda/cuda_include/cuda
-# Inject CUB and Thrust (v1.17.2 - compatible with GCC/TF 2.21)
-rm -rf /tmp/cuda_legacy_headers
-mkdir -p /tmp/cuda_legacy_headers
-wget -qO /tmp/cuda_legacy_headers/cub.tar.gz https://github.com/NVIDIA/cub/archive/refs/tags/1.17.2.tar.gz
-wget -qO /tmp/cuda_legacy_headers/thrust.tar.gz https://github.com/NVIDIA/thrust/archive/refs/tags/1.17.2.tar.gz
-tar -xzf /tmp/cuda_legacy_headers/cub.tar.gz -C /tmp/cuda_legacy_headers
-tar -xzf /tmp/cuda_legacy_headers/thrust.tar.gz -C /tmp/cuda_legacy_headers
 
-cp -r /tmp/cuda_legacy_headers/cub-1.17.2/cub $HOME/local_config_cuda_stub/cuda/cuda_include/
-cp -r /tmp/cuda_legacy_headers/thrust-1.17.2/thrust $HOME/local_config_cuda_stub/cuda/cuda_include/
-rm -rf /tmp/cuda_legacy_headers
+CUDA_TOOLKIT_INC=/usr/local/cuda-12.2/targets/ppc64le-linux/include
+if [ -d "$CUDA_TOOLKIT_INC/thrust" ]; then
+    cp -r "$CUDA_TOOLKIT_INC/thrust" $HOME/local_config_cuda_stub/cuda/cuda_include/
+    cp -r "$CUDA_TOOLKIT_INC/cub"    $HOME/local_config_cuda_stub/cuda/cuda_include/
+    [ -d "$CUDA_TOOLKIT_INC/cuda" ] && cp -r "$CUDA_TOOLKIT_INC/cuda" $HOME/local_config_cuda_stub/cuda/cuda_include/
+    echo ">>> Thrust/CUB/libcudacxx copiados do CUDA toolkit ($CUDA_TOOLKIT_INC)"
+    grep -E "#define THRUST_VERSION " $HOME/local_config_cuda_stub/cuda/cuda_include/thrust/version.h | head -1
+else
+    echo ">>> WARNING: $CUDA_TOOLKIT_INC nao encontrado, fallback Thrust 1.17.2"
+    rm -rf /tmp/cuda_legacy_headers
+    mkdir -p /tmp/cuda_legacy_headers
+    wget -qO /tmp/cuda_legacy_headers/cub.tar.gz https://github.com/NVIDIA/cub/archive/refs/tags/1.17.2.tar.gz
+    wget -qO /tmp/cuda_legacy_headers/thrust.tar.gz https://github.com/NVIDIA/thrust/archive/refs/tags/1.17.2.tar.gz
+    tar -xzf /tmp/cuda_legacy_headers/cub.tar.gz -C /tmp/cuda_legacy_headers
+    tar -xzf /tmp/cuda_legacy_headers/thrust.tar.gz -C /tmp/cuda_legacy_headers
+    cp -r /tmp/cuda_legacy_headers/cub-1.17.2/cub $HOME/local_config_cuda_stub/cuda/cuda_include/
+    cp -r /tmp/cuda_legacy_headers/thrust-1.17.2/thrust $HOME/local_config_cuda_stub/cuda/cuda_include/
+    rm -rf /tmp/cuda_legacy_headers
+fi
 
 # Ensure CUB, Thrust, and libcudacxx (CCCL) are present in the Bazel sandbox
 echo ">>> Injecting CUB (CCCL) directly into the CUDA stub..."
@@ -1332,12 +1393,9 @@ sed -i '1s/^/#include <cstdint>\n/' third_party/xla/xla/backends/cpu/codegen/bui
 #   __builtin_vectorelements: Clang 17+ has natively
 
 # --- PATCH PPC64LE: select_k_thunk uses _stub instead of _raft ---
-# The select_k_thunk BUILD uses if_cuda_is_configured to choose between
-# select_k_exec_raft (NVIDIA RAFT lib, unavailable on PPC64LE) and _stub.
-# Since we have CUDA configured, it picks _raft, but the @raft repo doesn't
-# actually exist (TF assumes CUDA implies RAFT, which doesn't hold outside x86_64).
-# We force use of _stub. Top-K will return UnimplementedError at runtime -
-# rare, usually only used in classification/ranking ops.
+# RAFT-ENABLE 2026-05-22: disabled to attempt real RAFT/RMM build on ppc64le.
+# Set RAFT_DISABLE=1 in the env to restore the stub fallback.
+if [ "${RAFT_DISABLE:-0}" = "1" ]; then
 echo ">>> Patching select_k_thunk BUILD to use _stub instead of _raft..."
 python3 - << 'SELECT_K_PATCH'
 import os, re
@@ -1372,6 +1430,7 @@ else:
         else:
             print(f'WARNING: pattern did not match in {p}')
 SELECT_K_PATCH
+fi  # RAFT-ENABLE: end of select_k stub block
 
 # --- PATCH PPC64LE: disable mlir_generated GPU kernels ---
 # These kernels depend on hlo_to_kernel running as a build tool, which doesn't link
@@ -1541,7 +1600,7 @@ BAZEL_OVERRIDE_FLAGS="\
     --override_repository=cuda_nvcc=$HOME/cuda_nvcc_stub \
     --override_repository=cuda_nvml=$HOME/cuda_redist_stub \
     --override_repository=cuda_nvtx=$HOME/cuda_redist_stub \
-    --override_repository=cuda_cccl=$HOME/cuda_redist_stub \
+    --override_repository=cuda_cccl=$HOME/cuda_cccl_stub \
     --override_repository=cuda_cudnn=$HOME/cuda_redist_stub \
     --override_repository=cuda_cudnn9=$HOME/cuda_redist_stub \
     --override_repository=cuda_cublas=$HOME/cuda_redist_stub \
@@ -2323,7 +2382,9 @@ clean_asm() {
 }
 
 for arg in "$@"; do
-    if [[ "$arg" == *.cu.cc ]]; then
+    # RAFT-ENABLE: select_k_exec_raft.cc inclui headers .cuh (CUDA device code).
+    # cuda_library nao basta - precisa do wrapper rotear pro modo NVCC.
+    if [[ "$arg" == *.cu.cc ]] || [[ "$arg" == *select_k_exec_raft.cc ]]; then
         IS_CUDA=1
     fi
     if [[ "$arg" == @* ]]; then
@@ -2332,7 +2393,7 @@ for arg in "$@"; do
             while read -r line; do
                 clean_line=$(echo "$line" | tr -d "'" | tr -d '"')
                 clean_asm "$clean_line"
-                if [[ "$clean_line" == *.cu.cc ]]; then IS_CUDA=1; fi
+                if [[ "$clean_line" == *.cu.cc ]] || [[ "$clean_line" == *select_k_exec_raft.cc ]]; then IS_CUDA=1; fi
             done < "$param_file"
         fi
         ARGS+=("$arg")
@@ -2603,7 +2664,9 @@ clean_asm() {
 }
 
 for arg in "$@"; do
-    if [[ "$arg" == *.cu.cc ]]; then
+    # RAFT-ENABLE: select_k_exec_raft.cc inclui headers .cuh (CUDA device code).
+    # cuda_library nao basta - precisa do wrapper rotear pro modo NVCC.
+    if [[ "$arg" == *.cu.cc ]] || [[ "$arg" == *select_k_exec_raft.cc ]]; then
         IS_CUDA=1
     fi
     if [[ "$arg" == @* ]]; then
@@ -2612,7 +2675,7 @@ for arg in "$@"; do
             while read -r line; do
                 clean_line=$(echo "$line" | tr -d "'" | tr -d '"')
                 clean_asm "$clean_line"
-                if [[ "$clean_line" == *.cu.cc ]]; then IS_CUDA=1; fi
+                if [[ "$clean_line" == *.cu.cc ]] || [[ "$clean_line" == *select_k_exec_raft.cc ]]; then IS_CUDA=1; fi
             done < "$param_file"
         fi
         ARGS+=("$arg")
@@ -3576,7 +3639,10 @@ DUMMY_PATCH
 
 # ==============================================================================
 # PATCH: Guard XLA .cc files that depend on Thrust/RAFT/RMM (CUDA toolkit)
+# RAFT-ENABLE 2026-05-22: disabled to attempt real RAFT/RMM build on ppc64le.
+# Set RAFT_DISABLE=1 in the env to re-guard select_k_exec_raft.cc.
 # ==============================================================================
+if [ "${RAFT_DISABLE:-0}" = "1" ]; then
 echo ">>> Guarding .cc files that depend on Thrust/RAFT/RMM..."
 python3 - << 'RAFT_PATCH'
 import os, subprocess
@@ -3618,6 +3684,7 @@ for rel_path in cuda_toolkit_files:
 
 print(f"OK: {count} RAFT/Thrust files guarded with #ifdef __CUDACC__")
 RAFT_PATCH
+fi  # RAFT-ENABLE: end of Thrust/RAFT/RMM guard block
 
 # ==============================================================================
 # PATCH: _Alignof -> alignof (C11 -> C++11) in buffer_debug_log_structs.h
@@ -4141,7 +4208,7 @@ bazel --host_jvm_args="-Xms4g" --host_jvm_args="-Xmx8g" build \
     --override_repository=cuda_nvcc=$HOME/cuda_nvcc_stub \
     --override_repository=cuda_nvml=$HOME/cuda_redist_stub \
     --override_repository=cuda_nvtx=$HOME/cuda_redist_stub \
-    --override_repository=cuda_cccl=$HOME/cuda_redist_stub \
+    --override_repository=cuda_cccl=$HOME/cuda_cccl_stub \
     --override_repository=cuda_cudnn=$HOME/cuda_redist_stub \
     --override_repository=cuda_cudnn9=$HOME/cuda_redist_stub \
     --override_repository=cuda_cublas=$HOME/cuda_redist_stub \
