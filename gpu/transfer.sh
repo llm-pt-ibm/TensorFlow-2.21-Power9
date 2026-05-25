@@ -1,92 +1,75 @@
 #!/bin/bash
-# Point the TF build at the newly-patched LLD.
+# Diagnostic: is libppc64_savres.a actually being used by the TF build?
 #
-# The TF build script (gpu/build_tf221_power9_gpu_generic.sh) probes:
-#   $HOME/tensorflow_gpu/llvm-install/bin/ld.lld
-# and falls back to the Conda LLD if missing.
+# Checks libtensorflow_framework.so for:
+#   - undefined refs (U/u) to _savegpr_NN / _restgpr_NN / _savefpr_NN / _restfpr_NN / _savevr_NN / _restvr_NN
+#       -> means SOME .o needs them; savres genuinely resolved the link
+#   - defined symbols (T/t) for the same names
+#       -> --whole-archive may have injected them; could be dead weight
 #
-# We just swap that path to point at the freshly-validated LLD at
-# /root/lld-ppc64-install (kept around so the standalone artifact remains
-# usable). The previous content of /root/tensorflow_gpu/llvm-install (if any)
-# is renamed *.bak.<timestamp> rather than deleted, so you can roll back.
+# Interpretation:
+#   undefined=0 defined=0  -> savres is completely inert; safe to drop from build
+#   undefined=0 defined>0  -> --whole-archive forced inclusion, but nothing references; ~few KB bloat
+#   undefined>0 defined>0  -> savres is genuinely resolving real refs; KEEP IT
 #
 # Usage on the container:
-#   bash transfer.sh                # do the swap
-#   ROLLBACK=1 bash transfer.sh     # restore the most recent .bak
+#   bash transfer.sh
 
 (
 set -e
 
-NEW_LLD_DIR="${NEW_LLD_DIR:-/root/lld-ppc64-install}"
-TF_LLD_DIR="${TF_LLD_DIR:-$HOME/tensorflow_gpu/llvm-install}"
+SO_LIST=(
+    "/root/miniforge3/envs/tf221_build/lib/python3.11/site-packages/tensorflow/libtensorflow_framework.so.2"
+    "/root/.cache/bazel/_bazel_root/fc0772529e3515d3f8f16399ba3b0fa0/execroot/org_tensorflow/bazel-out/ppc-opt/bin/tensorflow/python/libtensorflow_framework.so.2"
+)
 
-if [ "${ROLLBACK:-0}" = "1" ]; then
-    LATEST_BAK="$(ls -1dt "${TF_LLD_DIR}".bak.* 2>/dev/null | head -1)"
-    if [ -z "$LATEST_BAK" ]; then
-        echo "ERROR: no backup found matching ${TF_LLD_DIR}.bak.*"
-        exit 1
+for SO in "${SO_LIST[@]}"; do
+    echo "=== $SO ==="
+    if [ ! -f "$SO" ]; then
+        echo "  (not found, skipping)"
+        echo ""
+        continue
     fi
-    echo ">>> Rolling back: removing current $TF_LLD_DIR, restoring $LATEST_BAK"
-    rm -rf "$TF_LLD_DIR"
-    mv "$LATEST_BAK" "$TF_LLD_DIR"
-    ls -la "$TF_LLD_DIR/bin/ld.lld"
-    exit 0
-fi
+    echo "  size: $(ls -la "$SO" | awk '{print $5}') bytes"
 
-echo "=== Pointing TF build at $NEW_LLD_DIR ==="
+    UNDEF_COUNT=$(nm "$SO" 2>&1 | grep -cE ' [Uu] _(save|rest)(gpr|fpr|vr)_[0-9]+' || true)
+    DEF_COUNT=$(nm "$SO" 2>&1   | grep -cE ' [Tt] _(save|rest)(gpr|fpr|vr)_[0-9]+' || true)
 
-if [ ! -x "$NEW_LLD_DIR/bin/ld.lld" ]; then
-    echo "ERROR: $NEW_LLD_DIR/bin/ld.lld not found or not executable."
-    echo "       Build/validate it first (see lld-ppc64-fix/build_patched_lld.sh)."
-    exit 1
-fi
+    echo "  undefined refs (U/u): $UNDEF_COUNT"
+    echo "  defined symbols (T/t): $DEF_COUNT"
 
-mkdir -p "$(dirname "$TF_LLD_DIR")"
+    if [ "$DEF_COUNT" -gt 0 ]; then
+        echo "  sample defined (first 5):"
+        nm "$SO" 2>&1 | grep -E ' [Tt] _(save|rest)(gpr|fpr|vr)_[0-9]+' | head -5 | sed 's/^/    /'
+    fi
 
-# Backup whatever's currently there (file, dir, or symlink)
-if [ -e "$TF_LLD_DIR" ] || [ -L "$TF_LLD_DIR" ]; then
-    TS="$(date +%Y%m%d-%H%M%S)"
-    BAK="${TF_LLD_DIR}.bak.${TS}"
-    echo ">>> Existing $TF_LLD_DIR found — moving to $BAK"
-    mv "$TF_LLD_DIR" "$BAK"
-fi
+    if [ "$UNDEF_COUNT" -gt 0 ]; then
+        echo "  sample undefined (first 5):"
+        nm "$SO" 2>&1 | grep -E ' [Uu] _(save|rest)(gpr|fpr|vr)_[0-9]+' | head -5 | sed 's/^/    /'
+    fi
 
-# Symlink the new install into the path TF expects
-ln -s "$NEW_LLD_DIR" "$TF_LLD_DIR"
-echo ">>> Symlinked $TF_LLD_DIR -> $NEW_LLD_DIR"
+    echo ""
+    echo "  verdict:"
+    if [ "$UNDEF_COUNT" = "0" ] && [ "$DEF_COUNT" = "0" ]; then
+        echo "    INERT — savres is dead weight in this pipeline. Safe to drop."
+    elif [ "$UNDEF_COUNT" = "0" ] && [ "$DEF_COUNT" -gt 0 ]; then
+        echo "    BLOAT — savres force-linked via --whole-archive, but nothing references it."
+    else
+        echo "    GENUINELY USED — keep libppc64_savres.a, real refs being resolved."
+    fi
+    echo ""
+done
 
-# Sanity check: ld.lld resolves and reports the patched version
-echo ""
-echo "=== Sanity check ==="
-ls -la "$TF_LLD_DIR/bin/ld.lld"
-"$TF_LLD_DIR/bin/ld.lld" --version | head -1
-
-# Quick smoke test: link a trivial .so using the path the TF script will use
-TD="$(mktemp -d)"
-cat > "$TD/x.c" <<'EOF'
-int x(void) { return 42; }
-EOF
-gcc -c -fPIC "$TD/x.c" -o "$TD/x.o" 2>/dev/null || true
-if "$TF_LLD_DIR/bin/ld.lld" --shared "$TD/x.o" -o "$TD/libx.so" 2>"$TD/err"; then
-    echo ">>> Smoke link OK: $(file "$TD/libx.so" | head -1)"
-else
-    echo ">>> WARN: smoke link failed:"
-    sed 's/^/    /' "$TD/err"
-fi
-rm -rf "$TD"
-
-echo ""
-echo "============================================="
-echo " TF build is now wired to the patched LLD."
-echo ""
-echo " Next: run your TF build as usual, e.g."
-echo "   cd $HOME/TensorFlow-2.21-Power9   # adjust path"
-echo "   bash gpu/build_tf221_power9_gpu_generic.sh"
-echo ""
-echo " The TF script will pick up:"
-echo "   $TF_LLD_DIR/bin/ld.lld"
-echo " and set LD_LIBRARY_PATH=$TF_LLD_DIR/lib automatically."
-echo ""
-echo " Rollback: bash transfer.sh ROLLBACK=1"
-echo "============================================="
+# Bonus: check if any OTHER installed .so still references these symbols
+# (e.g. CUDA/cuDNN libs compiled with GCC elsewhere).
+echo "=== cross-check: scan other installed .so for unresolved save/restore refs ==="
+echo "  (any 'U _savegpr_NN' here means GCC-compiled lib still in the loader path)"
+for D in /root/cuda_unified/lib64 /root/miniforge3/envs/tf221_build/lib /root/tensorflow_gpu/llvm-install/lib ; do
+    [ -d "$D" ] || continue
+    find "$D" -maxdepth 1 -name '*.so*' -type f 2>/dev/null | while read F; do
+        N=$(nm "$F" 2>&1 | grep -cE ' [Uu] _(save|rest)(gpr|fpr|vr)_[0-9]+' || true)
+        [ "$N" -gt 0 ] && echo "    $F: $N undefined save/restore refs"
+    done
+done
+echo "  (silence above = no other lib references them; savres truly only matters for the TF .so)"
 )

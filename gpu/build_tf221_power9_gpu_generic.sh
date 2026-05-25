@@ -3926,20 +3926,18 @@ sed -i 's/3\.5/7.0/g' .tf_configure.bazelrc 2>/dev/null || true
 sed -i '/fuse-ld=gold/d' .tf_configure.bazelrc 2>/dev/null || true
 sed -i '/use-gold-linker/d' .tf_configure.bazelrc 2>/dev/null || true
 
-# Linker: LLD + patcher v6 (known FUNCTIONAL configuration).
+# Linker: patched LLD with the multi-TOC r2 save fix (see lld-ppc64-fix/ for
+# the standalone artifact — 3 edits to lld/ELF/Thunks.cpp that emit
+# std r2,24(r1) in PPC64LongBranchThunk + conditional needsTocRestore based
+# on destination st_other). Falls back to Conda's stock LLD if the patched
+# build isn't present, but expect static-init segfaults (e.g. inside
+# __sti____cudaRegisterAll on libtensorflow_framework.so) without the patch.
 #
-# LLD handles relocations better than BFD on large libs. Patcher v6
-# (patch_nv_toc_save.py, invoked after pip install) covers the remaining PPC64LE ABI bug:
-# neither GCC nor Clang emit `std r2, 24(r1)` on intra-.so calls
-# (correct per ELFv2 ABI), but LLD inserts __long_branch_* inter-TOC stubs
-# that corrupt r2. The patcher injects wrappers (`std r2,24(r1); b stub`) into
-# 16 bytes of zero padding after each cuda stub + direct bls to __cuda*/__nv*
-# in functions without prologue save.
-#
-# Validated state: TF imports + 2x V100 detected via list_physical_devices.
-# GPU Matmul may still crash in other uncovered chains (architectural
-# GCC/NVCC bug, requires upstream fix).
-# Use patched LLD (with r2 TOC save fix) if available, otherwise Conda LLD.
+# Historical note: an earlier post-link patcher (patch_nv_toc_save.py /
+# "patcher v6") used to inject the same std r2,24(r1) wrappers into the
+# already-linked .so. It was never wired into this script (only referenced
+# in comments) — the link-time fix in the patched LLD supersedes it. The
+# .py file is kept in this directory for reference; safe to ignore.
 PATCHED_LLD="$HOME/tensorflow_gpu/llvm-install/bin/ld.lld"
 if [ -x "$PATCHED_LLD" ]; then
     BAZEL_FUSE_LD="$PATCHED_LLD"
@@ -3947,19 +3945,29 @@ if [ -x "$PATCHED_LLD" ]; then
     echo ">>> Using PATCHED LLD (with multi-TOC r2 save fix): $PATCHED_LLD"
 else
     BAZEL_FUSE_LD="lld"
-    echo ">>> Using Conda LLD (without r2 fix). Patcher v6 will be applied."
+    echo ">>> Using Conda LLD (UNPATCHED — expect TF static-init crashes)."
 fi
 echo ">>> Linker selected for Bazel: -fuse-ld=${BAZEL_FUSE_LD}"
 
 # ----------------------------------------------------------------------------
-# LLD does NOT auto-generate the _savefpr_NN/_restfpr_NN/_savevr_NN/_restvr_NN/
-# _savegpr_NN/_restgpr_NN stubs that GCC references in out-of-line prologues/epilogues
-# (optimization for many callee-saved registers). BFD generates inline stubs,
-# LLD requires external linkage. libgcc has double-underscore versions but
-# not single-underscore, so we generate the stubs in asm here.
+# libppc64_savres.a: hand-written stubs for _savefpr_NN/_restfpr_NN/_savegpr_NN/
+# _restgpr_NN/_savevr_NN/_restvr_NN. Force-linked via --whole-archive below so
+# they SHADOW the versions that ship inside conda's libgcc.a.
 #
-# With BFD (current), this block is dispensable but we keep it in case we
-# return to LLD. We skip generation if BAZEL_FUSE_LD is not lld.
+# Why shadowing matters with the patched LLD:
+#   - conda's libgcc.a was compiled with -fno-plt and emits these helpers with
+#     a non-zero st_other (global entry / CLOBBERS_R2 marker).
+#   - Our patched LLD's conditional needsTocRestore (patch [3] in
+#     lld-ppc64-fix/) correctly treats those callees as r2-clobbering and
+#     expects a trailing nop after every bl that targets them.
+#   - libgcc's own callers (e.g. __floatunditf -> _restfpr_30) lack that nop
+#     => link fails with "call to _restfpr_30 lacks nop, can't restore toc".
+#   - Our hand-written stubs have st_other == 0 (leaf, no global entry), so
+#     the patched LLD's conditional check is false for them, no nop is
+#     required, and the libgcc callers link cleanly.
+#
+# Force-linking the .a via -Wl,--whole-archive ensures OUR symbols win symbol
+# resolution over libgcc's; libgcc's versions are then never referenced.
 # ----------------------------------------------------------------------------
 if [[ "$BAZEL_FUSE_LD" == *lld* ]]; then
 SAVRES_DIR=$HOME/ppc64_savres
@@ -4372,7 +4380,6 @@ fi
 # ld r2,24(r1) (LE bytes 18 00 41 e8). Safe because the standard prologue of
 # any function that calls another function always does std r2,24(r1).
 # ----------------------------------------------------------------------------
-# (TOC patching done post-pip install via patch_nv_toc_save.py - see line ~4095)
 
 echo "   -> Repackaging Wheel..."
 rm original.whl
