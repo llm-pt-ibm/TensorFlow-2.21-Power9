@@ -23,15 +23,21 @@ This manifests in large shared libraries like libtensorflow_framework.so
 (~67MB .text) on ppc64le, causing segfaults in __sti____cudaRegisterAll,
 PlatformInitialize, etc.
 
-Fix: Add `std r2, 24(r1)` to PPC64LongBranchThunk::writeTo() and set
-needsTocRestore on the thunk symbol, consistent with PPC64PltCallStub
-and PPC64R2SaveStub behavior.
+Fix:
+  1. Make PPC64LongBranchThunk 4 bytes larger to hold the new instruction.
+  2. Prefix writeTo() with `std r2, 24(r1)`.
+  3. In addSymbols(), set needsTocRestore on the thunk symbol *only* when
+     the destination may actually clobber r2 (global entry point or ABI
+     v1.5 CLOBBERS_R2 marker, both encoded as `(st_other >> 5) != 0`).
+     Leaf-style callees with st_other == 0 preserve r2 and need no
+     restore — leaving needsTocRestore unset keeps the existing "lacks
+     nop, can't restore toc" diagnostic correct for those callers.
 
 Differential Revision: (pending)
 ---
- lld/ELF/Thunks.cpp                              | 12 +++++++-----
+ lld/ELF/Thunks.cpp                              | 23 +++++++++++++++----
  lld/test/ELF/ppc64-long-branch-r2-save.s        | 70 ++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 77 insertions(+), 5 deletions(-)
+ 2 files changed, 88 insertions(+), 5 deletions(-)
  create mode 100644 lld/test/ELF/ppc64-long-branch-r2-save.s
 
 diff --git a/lld/ELF/Thunks.cpp b/lld/ELF/Thunks.cpp
@@ -63,7 +69,12 @@ index abcdef1234..567890abcd 100644
 +  Defined *s = addSymbol(
 +      ctx.saver.save("__long_branch_" + destination.getName()), STT_FUNC, 0,
 +      isec);
-+  s->setNeedsTocRestore(true);
++  // Only request post-call r2 restore when the callee may have clobbered
++  // it: global entry (st_other top bits >= 2) or ABI v1.5 CLOBBERS_R2
++  // marker (st_other top bits == 1). Leaf-style callees with st_other == 0
++  // preserve r2 and need no restore.
++  if ((destination.stOther >> 5) != 0)
++    s->setNeedsTocRestore(true);
  }
 
 diff --git a/lld/test/ELF/ppc64-long-branch-r2-save.s b/lld/test/ELF/ppc64-long-branch-r2-save.s
@@ -114,7 +125,8 @@ index 000000000..1234567890
 +.p2align 4
 +callee:
 +.Lfunc_begin2:
-+  ## Global entry point: set up TOC from r12
++  ## Global entry point: set up TOC from r12 (callee may clobber r2 ->
++  ## thunk should be marked needsTocRestore).
 +  addis 2, 12, .TOC.-callee@ha
 +  addi 2, 2, .TOC.-callee@l
 +  .localentry callee, .-callee

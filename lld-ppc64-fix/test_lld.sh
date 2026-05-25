@@ -1,13 +1,18 @@
 #!/bin/bash
-# Test suite for LLD PPC64LE patch (v3 - Clang vs GAS detection).
+# Test suite for LLD PPC64LE patch (v4 - conditional needsTocRestore).
 #
-# T1: PPC64LongBranchThunk includes `std r2, 24(r1)` (our patch)
-# T2: LongBranchThunk has needsTocRestore => nop after bl becomes `ld r2,24(r1)`
+# T1: PPC64LongBranchThunk includes `std r2, 24(r1)` (patch [2], unconditional)
+# T2: LongBranchThunk to global-entry callee => nop after bl patched to
+#     `ld r2,24(r1)` (patch [3], conditional on stOther)
 # T3: bl to .localentry sym,1 -> LLD creates PPC64R2SaveStub + patches nop
-# T4: "lacks nop" error is suppressed when call lacks trailing nop
+#     (upstream behavior, not affected by our patches)
+# T4: LongBranchThunk to LEAF callee (stOther == 0) => std r2,24 still emitted
+#     in thunk, but nop after bl NOT patched (refinement validation: patch [3]
+#     correctly skips needsTocRestore when callee preserves r2)
 #
 # CRITICAL: GAS old versions reject `.localentry sym, 1` ("not a valid power of 2").
-# Clang's integrated assembler may accept it. We try both.
+# Clang's integrated assembler accepts it. We try both for T3.
+# T1+T2 use `.localentry sym, 8` (global-entry form) which works in GAS too.
 
 set -o pipefail
 # Do not 'set -u' or 'set -e'.
@@ -19,9 +24,9 @@ LLD="${LLD_PATH:-$HOME/tensorflow_gpu/llvm-install/bin/ld.lld}"
 echo "=== LLD: $LLD ==="
 "$LLD" --version | head -1
 if strings "$LLD" 2>/dev/null | grep -q "lacks nop"; then
-    echo "  NOTE: 'lacks nop' message STILL in LLD binary."
+    echo "  NOTE: 'lacks nop' diagnostic present in LLD binary (expected — we no longer suppress it)."
 else
-    echo "  NOTE: 'lacks nop' message REMOVED from LLD binary."
+    echo "  NOTE: 'lacks nop' diagnostic missing — older build may still suppress it."
 fi
 
 # Diagnose assembler support for .localentry sym, 1
@@ -122,12 +127,17 @@ report() {
 }
 
 # ============================================================
-# T1+T2: __long_branch_target_func - intra-module, 34MB gap
-# Use simple .S without .localentry to avoid GAS issue here
+# T1+T2: __long_branch_target_func - intra-module, 34MB gap.
+# target_func is marked `.localentry 8` (global-entry form) so that
+# stOther encodes a non-zero local-entry offset. Our refined patch [3]
+# detects this and sets needsTocRestore on the thunk symbol, which
+# triggers the nop->ld r2,24(r1) rewrite (T2).
+# GAS 2.30+ accepts `.localentry sym, 8` (power-of-2 form).
 # ============================================================
-echo "=== T1+T2: LongBranchThunk std r2,24 + nop patched ==="
+echo "=== T1+T2: LongBranchThunk std r2,24 + nop patched (global-entry callee) ==="
 TD=$(mktemp -d); cd "$TD"
 cat > monolith.s << 'EOF'
+    .abiversion 2
     .text
     .globl _start
     .type _start, @function
@@ -141,6 +151,7 @@ _start:
     .globl target_func
     .type target_func, @function
 target_func:
+    .localentry target_func, 8
     blr
 EOF
 $AS_CMD monolith.s -o monolith.o 2>/tmp/t12_err.txt
@@ -270,49 +281,62 @@ cd /; rm -rf "$TD"
 echo ""
 
 # ============================================================
-# T4: bl without trailing nop survives
+# T4: LongBranchThunk to LEAF callee (stOther == 0)
+# Validates refined patch [3]: thunk still has std r2,24(r1) (patch [2] is
+# unconditional) but nop after bl is NOT patched (needsTocRestore correctly
+# left unset because target_leaf preserves r2).
 # ============================================================
-echo "=== T4 prep: grep -a 'lacks nop' in LLD bin + libs ==="
-# "lacks nop" vive em liblldELF.so (BUILD_SHARED_LIBS=ON), nao em ld.lld.
-LLD_DIR=$(dirname "$LLD")
-LLD_PARENT=$(dirname "$LLD_DIR")
-for F in "$LLD" "$LLD_PARENT/lib"/lib*ELF*.so* "$LLD_PARENT/lib"/lib*Common*.so*; do
-    [ -f "$F" ] || continue
-    N=$(grep -aoc "lacks nop" "$F" 2>/dev/null)
-    [ "$N" -gt 0 ] && echo "  $F: $N hit(s)"
-done
-echo ""
-echo "=== T4: bl without trailing nop survives ==="
+echo "=== T4: LongBranchThunk to leaf callee — std r2,24 yes, nop NOT patched ==="
 TD=$(mktemp -d); cd "$TD"
-cat > target.c << 'EOF'
-void target_no_nop(void) {}
-EOF
-gcc -shared -fPIC target.c -o libtarget.so 2>/dev/null
-
-cat > caller.s << 'EOF'
+cat > monolith_leaf.s << 'EOF'
     .text
     .globl _start
     .type _start, @function
 _start:
-    bl target_no_nop
-    addi 1, 1, 0
+    bl target_leaf
+    nop
+    blr
+    .space 34000000
+    .hidden target_leaf
+    .globl target_leaf
+    .type target_leaf, @function
+target_leaf:
     blr
 EOF
-$AS_CMD caller.s -o caller.o 2>/tmp/t4_err.txt
-if [ ! -f caller.o ]; then
+$AS_CMD monolith_leaf.s -o monolith_leaf.o 2>/tmp/t4_err.txt
+if [ ! -f monolith_leaf.o ]; then
     echo "  asm error:"; sed 's/^/    /' /tmp/t4_err.txt
-    report "T4" 0 "asm failed"
+    report "T4 (thunk std r2,24)" 0 "asm failed"
+    report "T4 (nop NOT patched)" 0 "skipped"
 else
-    LOG=$("$LLD" caller.o -L. -ltarget -o test_bin 2>&1)
-    if [ -n "$LOG" ]; then
-        echo "  linker log: ${LOG:0:300}"
-    fi
-    if echo "$LOG" | grep -q "lacks nop"; then
-        report "T4 (no 'lacks nop' error)" 0 "error: lacks nop"
-    elif [ -f test_bin ]; then
-        report "T4 (no 'lacks nop' error)" 1
+    LOG=$("$LLD" --shared monolith_leaf.o -o test_leaf.so 2>&1)
+    if [ ! -f test_leaf.so ]; then
+        echo "  link error: ${LOG:0:300}"
+        report "T4 (thunk std r2,24)" 0 "link failed"
+        report "T4 (nop NOT patched)" 0 "skipped"
     else
-        report "T4 (no 'lacks nop' error)" 0 "link failed: ${LOG:0:200}"
+        objdump -d test_leaf.so > dump.txt 2>/dev/null
+        # Thunk std r2,24 — still expected (unconditional patch [2])
+        thunk_block=$(awk '/<__long_branch_target_leaf>:/{flag=1; next} flag && /^[0-9a-f]+ <[^>]+>:/{exit} flag' dump.txt)
+        first_insn=$(echo "$thunk_block" | head -1)
+        if echo "$first_insn" | grep -qE "std *r?2,24\(r?1\)"; then
+            report "T4.1 (thunk std r2,24 still emitted)" 1
+        else
+            report "T4.1 (thunk std r2,24 still emitted)" 0 "first: ${first_insn:0:80}"
+        fi
+        # Nop after bl — should remain nop, NOT be patched
+        start_block=$(awk '/<_start>:/{flag=1; next} flag && /^[0-9a-f]+ <[^>]+>:/{exit} flag' dump.txt)
+        after_bl=$(echo "$start_block" | sed -n '2p')
+        # Check for ld r2,24(r1) FIRST (the patched form) before falling
+        # back to plain nop — objdump's line includes hex bytes between the
+        # offset and the mnemonic (e.g. "10298: 00 00 00 60 nop").
+        if echo "$after_bl" | grep -qE "ld *r?2,24\(r?1\)"; then
+            report "T4.2 (nop NOT patched — leaf preserves r2)" 0 "patched anyway: ${after_bl:0:80}"
+        elif echo "$after_bl" | grep -q "nop"; then
+            report "T4.2 (nop NOT patched — leaf preserves r2)" 1
+        else
+            report "T4.2 (nop NOT patched — leaf preserves r2)" 0 "unexpected: ${after_bl:0:80}"
+        fi
     fi
 fi
 cd /; rm -rf "$TD"

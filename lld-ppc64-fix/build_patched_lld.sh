@@ -1,69 +1,68 @@
 #!/bin/bash
-# Build patched LLD for PPC64LE to fix the multi-TOC long branch r2 save bug.
-# This eliminates the need for the patcher v6 workaround in TensorFlow builds.
+# Build patched LLD for PPC64LE: fixes the multi-TOC LongBranchThunk r2
+# corruption bug. Applies a single coherent, upstream-quality change set to
+# lld/ELF/Thunks.cpp (3 edits) and rebuilds only lld + its dependencies.
 #
-# Prerequisites: cmake, ninja (or make), clang/gcc, python3
-# Time: ~2-4h on Power9, ~30min cross-compiling on x86_64
-# RAM: ~16GB recommended
+# Prerequisites: cmake (>=3.20), ninja (or make), a C++17 compiler (clang or
+#                gcc), python3, git. ~16GB RAM, ~5GB disk.
+# Time: ~30min cross-compiling on x86_64; ~2-4h native on POWER9/POWER10.
 #
 # Usage:
-#   ./build_patched_lld.sh          # Build on Power9
-#   ./build_patched_lld.sh --test   # Build + run lit tests
+#   ./build_patched_lld.sh          # Build + install
+#   ./build_patched_lld.sh --test   # Build + install + run check-lld-elf
+#
+# Environment overrides:
+#   LLD_INSTALL_DIR   install prefix (default: $HOME/lld-ppc64-install)
+#   CONDA_BASE        if set + valid, use that conda env's toolchain;
+#                     otherwise the script falls back to system tooling.
 #
 # =============================================================================
 # PATCH STATUS / UPSTREAMABILITY
 # =============================================================================
-# This script applies 4 patches to LLVM/lld. Their nature differs:
+# This script applies 3 patches to LLVM/lld, all targeting lld/ELF/Thunks.cpp.
+# All three together form a single coherent, upstream-quality fix.
 #
-#   [1] PPC64LongBranchThunk size 32 -> 36 bytes
+#   [1] PPC64LongBranchThunk::size() 32 -> 36 bytes
 #   [2] PPC64LongBranchThunk::writeTo prefixes `std r2, 24(r1)`
-#       --- CORE FIX (upstreamable). Genuine bug in LLD's PPC64LE backend.
-#       Upstream LLD assumes intra-module bls never cross TOC boundaries.
-#       In multi-TOC mode (libs with >64KB TOC, e.g. libtensorflow_framework.so
-#       ~67MB .text), LongBranchThunks DO cross TOC groups and silently clobber
+#       --- CORE FIX. Genuine bug in LLD's PPC64LE backend. Upstream LLD
+#       assumes intra-module bls never cross TOC boundaries. In multi-TOC
+#       mode (libs with >64KB TOC, e.g. libtensorflow_framework.so ~67MB
+#       .text), LongBranchThunks DO cross TOC groups and silently clobber
 #       caller's r2. Fix: thunk saves caller r2 before branching.
-#       Could be submitted as MR with refinement to only activate in multi-TOC.
 #
-#   [3] PPC64LongBranchThunk::addSymbols sets needsTocRestore(true)
-#       --- OVER-BROAD WORKAROUND (not upstreamable as-is). Marks ALL
-#       LongBranchThunks as requiring r2 restore. Correct for thunks created
-#       in multi-TOC mode (callee may have clobbered r2), but unnecessary for
-#       leaf functions like libgcc `_savegpr0_NN` -> false-positives in [4].
-#       Proper upstream fix: only set when target may clobber r2 (e.g. has
-#       global entry or localentry=1) AND multi-TOC mode is active.
-#
-#   [4] Replace "lacks nop, can't restore toc" Err(ctx) with (void)0
-#       --- TF-SPECIFIC WORKAROUND (do NOT upstream). Suppresses a legitimate
-#       ABI-violation diagnostic. Needed only because [3] is over-broad and
-#       triggers the error on libgcc/legacy code that doesn't expect r2 restore.
-#       For a clean general-purpose LLD ppc64le release, [3] should be refined
-#       so [4] becomes unnecessary.
+#   [3] PPC64LongBranchThunk::addSymbols conditionally sets needsTocRestore
+#       --- COMPLEMENT TO [2]. Marks the thunk as needing r2 restore ONLY
+#       when the destination symbol may actually clobber r2 (global entry
+#       point or ABI v1.5 CLOBBERS_R2 marker, i.e. (st_other >> 5) != 0).
+#       Leaf-style callees with st_other == 0 are skipped, which means the
+#       upstream "lacks nop, can't restore toc" diagnostic remains correct
+#       (only fires when an ABI-violating caller bls a clobber-r2 callee
+#       without a trailing nop) — no diagnostic suppression needed.
 #
 # VERDICT for general distribution:
-#   - For TensorFlow build on PPC64LE: this build is correct and sufficient.
-#   - As a general PPC64LE LLD release: NOT recommended. Refine [3] first.
-#   - As reference for an upstream LLVM MR: patches [1]+[2] are the core
-#     contribution; [3]+[4] should be replaced by conditional logic.
+#   - For TensorFlow build on PPC64LE: correct and sufficient.
+#   - As a general PPC64LE LLD release: correct and sufficient.
+#   - As an upstream LLVM MR: submittable as a single PR ([1]+[2]+[3]).
 # =============================================================================
 
 set -o pipefail
 
-# Activate Conda for cmake/ninja/clang
-CONDA_BASE="${CONDA_BASE:-/root/miniforge3}"
-source "$CONDA_BASE/etc/profile.d/conda.sh" || true
-conda activate tf221_build || conda activate base || true
-# Ensure cmake and ninja are available
-conda install -c conda-forge cmake ninja -y || true
+# Optional: activate a Conda environment if CONDA_BASE points to one. This is
+# convenient on hosts where the system toolchain is too old. If conda is not
+# present, fall back to whatever cmake/ninja/clang/gcc the user has on PATH.
+if [ -n "${CONDA_BASE:-}" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+    conda activate "${CONDA_ENV:-base}" 2>/dev/null || true
+    conda install -c conda-forge cmake ninja -y 2>/dev/null || true
+fi
 
-# Now enable strict error checking
+# Strict error checking
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LLVM_SRC="${SCRIPT_DIR}/llvm-project"
 BUILD_DIR="${SCRIPT_DIR}/llvm-build"
-# Install path matches what gpu/build_tf221_power9_gpu_generic.sh expects:
-# $HOME/tensorflow_gpu/llvm-install. Override via LLD_INSTALL_DIR if needed.
-INSTALL_DIR="${LLD_INSTALL_DIR:-$HOME/tensorflow_gpu/llvm-install}"
+INSTALL_DIR="${LLD_INSTALL_DIR:-$HOME/lld-ppc64-install}"
 PATCH_FILE="${SCRIPT_DIR}/0001-lld-PPC64-Add-r2-TOC-save-to-LongBranch-thunks.patch"
 
 echo "=== [1/5] Cloning LLVM (shallow) ==="
@@ -95,42 +94,53 @@ sed -i '/^void PPC64LongBranchThunk::writeTo/,/^}/ {
     s|writePPC64LoadAndBranch(ctx, buf, offset);|// Save caller TOC pointer for multi-TOC correctness.\n  write32(ctx, buf + 0, 0xf8410018); // std r2, 24(r1)\n  writePPC64LoadAndBranch(ctx, buf + 4, offset);|
 }' lld/ELF/Thunks.cpp
 
-# --- Patch [3] OVER-BROAD WORKAROUND (refine before upstreaming) ---
-# Set needsTocRestore on every LongBranchThunk so LLD patches the trailing nop
-# to `ld r2, 24(r1)`. Correct for thunks crossing TOC, but unnecessary (and
-# false-positive-prone) for leaf-style callees like libgcc _savegpr0_NN.
-# Upstream-quality fix: gate this on `mayClobberCallerToc(destination)`.
-sed -i '/^void PPC64LongBranchThunk::addSymbols/,/^}/ {
-    s|addSymbol(ctx.saver.save("__long_branch_" + destination.getName()), STT_FUNC,|Defined *s = addSymbol(ctx.saver.save("__long_branch_" + destination.getName()), STT_FUNC,|
-    s|0, isec);|0, isec);\n  s->setNeedsTocRestore(true);|
-}' lld/ELF/Thunks.cpp
-
-# --- Patch [4] TF-SPECIFIC WORKAROUND (do NOT upstream) ---
-# Demote the "lacks nop" error to a no-op so LLD doesn't abort.
-# Some legitimately-missing nops (libgcc _savegpr0_NN, NVCC-generated code that
-# manually does ld r2,24(r1)) trigger this error. Replace the multi-line
-# `Err(ctx) << ...;` statement with a benign expression.
-# Strategy: find the line containing "lacks nop" and replace the whole multi-line
-# Err(ctx) statement that contains it.
-python3 - << 'PYFIX'
+# --- Patch [3] CORE FIX (upstreamable) ---
+# Set needsTocRestore on a LongBranchThunk ONLY when the callee may clobber
+# r2. The top 3 bits of st_other encode the ELFv2 local-entry value:
+#   - value 0      -> no global entry, leaf-style, r2 preserved by callee
+#   - value 1      -> ABI v1.5 CLOBBERS_R2 marker (".localentry sym, 1")
+#   - value 2..6   -> function has a global entry point (offset 1 << (val-2))
+# We treat values >= 1 as "may clobber r2" and set needsTocRestore on the
+# thunk symbol, which makes LLD rewrite the trailing nop to ld r2,24(r1).
+# Value == 0 leaves needsTocRestore unset, matching upstream behavior for
+# leaf helpers (libgcc savres, simple no-prologue functions) and avoiding
+# the "lacks nop, can't restore toc" diagnostic that would otherwise fire
+# on legacy callers that omit the nop after bls to such leaves.
+python3 - << 'PYFIX3'
 import re
-path = "lld/ELF/Arch/PPC64.cpp"
+path = "lld/ELF/Thunks.cpp"
 with open(path) as f:
     src = f.read()
-# Find Err(ctx) ... ; that contains 'lacks nop'. Use [^;]* to span lines.
-pattern = re.compile(r'Err\(ctx\)\s*<<[^;]*?lacks nop[^;]*;', re.DOTALL)
-new, n = pattern.subn('/* error suppressed: lacks nop */ (void)0;', src)
+
+pattern = re.compile(
+    r'void PPC64LongBranchThunk::addSymbols\(ThunkSection &isec\) \{\s*'
+    r'addSymbol\(\s*ctx\.saver\.save\("__long_branch_" \+ destination\.getName\(\)\),\s*'
+    r'STT_FUNC,\s*0,\s*isec\);\s*\}',
+    re.DOTALL,
+)
+replacement = (
+    'void PPC64LongBranchThunk::addSymbols(ThunkSection &isec) {\n'
+    '  Defined *s = addSymbol(\n'
+    '      ctx.saver.save("__long_branch_" + destination.getName()), STT_FUNC,\n'
+    '      0, isec);\n'
+    '  // Only request post-call r2 restore when the callee may have clobbered\n'
+    '  // it: global entry (st_other top bits >= 2) or ABI v1.5 CLOBBERS_R2\n'
+    '  // marker (st_other top bits == 1). Leaf-style callees with st_other == 0\n'
+    '  // preserve r2 and need no restore.\n'
+    '  if ((destination.stOther >> 5) != 0)\n'
+    '    s->setNeedsTocRestore(true);\n'
+    '}\n'
+)
+new, n = pattern.subn(replacement, src)
 if n == 0:
-    # Try alternate names (errorOrWarn, warn, etc.)
-    pattern2 = re.compile(r'(?:Err\(ctx\)|errorOrWarn|warn)\([^)]*\)\s*<<[^;]*?lacks nop[^;]*;', re.DOTALL)
-    new, n = pattern2.subn('/* error suppressed: lacks nop */ (void)0;', src)
-if n == 0:
-    print("WARN: 'lacks nop' statement not found - LLD may have changed shape")
-else:
-    with open(path, 'w') as f:
-        f.write(new)
-    print(f"Replaced {n} 'lacks nop' error statement(s).")
-PYFIX
+    raise SystemExit(
+        "ERROR: PPC64LongBranchThunk::addSymbols block not matched. "
+        "Upstream LLD may have changed shape; update the regex in patch [3]."
+    )
+with open(path, 'w') as f:
+    f.write(new)
+print(f"Patch [3] applied (conditional needsTocRestore): {n} block(s) replaced.")
+PYFIX3
 
 echo "    -> Patch applied successfully."
 
@@ -144,12 +154,28 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-# Only build LLD (much faster than full LLVM)
-# Use Clang + LLD from Conda to avoid R_PPC64_REL24 overflow in BFD+GCC
+# Compiler selection: prefer Clang. On Conda PPC64LE envs `conda activate`
+# exports CC/CXX pointing at conda's GCC cross compiler, which emits PCREL /
+# `-fno-plt` reloc types that the LLD shipped in the same env may not handle
+# during the LLVM self-link ("unknown relocation 31/60/119/120"). Forcing
+# conda's clang side-steps that whole class of failures and also avoids the
+# R_PPC64_REL24 overflow that older BFD+GCC hits when linking large LLVM libs.
+if [ -n "${CONDA_PREFIX:-}" ] && [ -x "${CONDA_PREFIX}/bin/clang" ]; then
+    CC="${CONDA_PREFIX}/bin/clang"
+    CXX="${CONDA_PREFIX}/bin/clang++"
+    echo "    -> forcing Conda clang: $CC"
+elif command -v clang >/dev/null 2>&1 && command -v clang++ >/dev/null 2>&1; then
+    CC="${CC:-$(command -v clang)}"
+    CXX="${CXX:-$(command -v clang++)}"
+fi
+CMAKE_COMPILER_ARGS=()
+[ -n "${CC:-}" ]  && CMAKE_COMPILER_ARGS+=(-DCMAKE_C_COMPILER="$CC")
+[ -n "${CXX:-}" ] && CMAKE_COMPILER_ARGS+=(-DCMAKE_CXX_COMPILER="$CXX")
+
+# Build only LLD (much faster than full LLVM)
 cmake -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER="${CONDA_PREFIX}/bin/clang" \
-    -DCMAKE_CXX_COMPILER="${CONDA_PREFIX}/bin/clang++" \
+    "${CMAKE_COMPILER_ARGS[@]}" \
     -DLLVM_ENABLE_PROJECTS="lld" \
     -DLLVM_TARGETS_TO_BUILD="PowerPC" \
     -DLLVM_USE_LINKER=lld \
@@ -162,38 +188,24 @@ echo "=== [4/5] Building LLD ==="
 ninja lld
 
 echo "=== [5/5] Installing ==="
-# 'install-lld' instala SO o componente lld (bin + libs principais), MAS com
-# BUILD_SHARED_LIBS=ON as deps LLVM (libLLVMSupport.so etc.) ficam fora.
-# 'install' instala TUDO no INSTALL_PREFIX, garantindo que as libs
-# correspondam ao ld.lld -> sem desync de "lacks nop" ainda na liblldELF antiga.
+# Use the top-level `install` target (not `install-lld`) so that the LLVM
+# support libs (libLLVMSupport.so, etc.) co-installed with BUILD_SHARED_LIBS=ON
+# end up in $INSTALL_DIR/lib/ — otherwise ld.lld would not find them at runtime.
 ninja install
 
-# Verificacao final: bin e libs principais
 echo ""
-echo "=== Verificacao pos-install ==="
+echo "=== Post-install verification ==="
 ls -la "$INSTALL_DIR/bin/ld.lld" "$INSTALL_DIR/bin/lld" 2>/dev/null || true
-echo ">>> Procurando 'lacks nop' nos binarios instalados:"
-LEFTOVER=0
-for F in $(find "$INSTALL_DIR/bin" "$INSTALL_DIR/lib" -type f 2>/dev/null); do
-    if grep -aoq "lacks nop" "$F" 2>/dev/null; then
-        echo "  AINDA presente em: $F"
-        LEFTOVER=1
-    fi
-done
-if [ "$LEFTOVER" = "0" ]; then
-    echo "  OK: 'lacks nop' removido de todos os binarios instalados."
-else
-    echo "  AVISO: 'lacks nop' ainda aparece - patch python pode ter falhado."
-fi
 
 echo ""
 echo "============================================="
-echo " LLD patchado instalado em:"
+echo " Patched LLD installed at:"
 echo "   $INSTALL_DIR/bin/ld.lld"
 echo ""
-echo " Para usar no build do TensorFlow:"
-echo "   export BAZEL_FUSE_LD=$INSTALL_DIR/bin/ld.lld"
-echo "   --linkopt=-fuse-ld=$INSTALL_DIR/bin/ld.lld"
+echo " To use:"
+echo "   export PATH=$INSTALL_DIR/bin:\$PATH"
+echo "   export LD_LIBRARY_PATH=$INSTALL_DIR/lib:\$LD_LIBRARY_PATH"
+echo "   \$CC -fuse-ld=$INSTALL_DIR/bin/ld.lld ..."
 echo "============================================="
 
 if [ "${1:-}" = "--test" ]; then

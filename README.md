@@ -24,10 +24,9 @@ python3 gpu/gpu_test_suite.py                  # functional test suite
 
 `lld-ppc64-fix/build_patched_lld.sh` patches LLD with:
 - `PPC64LongBranchThunk` prefixed with `std r2,24(r1)` (multi-TOC fix)
-- `setNeedsTocRestore(true)` so LLD auto-patches the trailing `nop` to `ld r2,24(r1)`
-- Suppression of "lacks nop, can't restore toc" error for libgcc compatibility
+- `setNeedsTocRestore(true)` only when callee may clobber `r2` (global entry or `.localentry=1`), so LLD auto-patches the trailing `nop` to `ld r2,24(r1)` while keeping the upstream `"lacks nop"` diagnostic correct for leaf callees
 
-See `lld-ppc64-fix/build_patched_lld.sh` header for patch upstream-ability notes.
+Upstreamable as a single PR. See `lld-ppc64-fix/README.md` for full details.
 
 ### 2. cuDNN 9 headers enforced
 
@@ -76,9 +75,11 @@ gpu/
   gpu_test_suite.py                    76 functional tests covering all TF surfaces
   transfer.sh                          rotating diagnostic / transfer helper
   patch_nv_toc_save.py                 obsolete patcher v6 (kept for reference)
-lld-ppc64-fix/
+lld-ppc64-fix/                          standalone, see lld-ppc64-fix/README.md
   build_patched_lld.sh                 patched LLD for PPC64LE
-  test_lld.sh                          7 LLD validation tests
+  test_lld.sh                          8 LLD validation tests
+  0001-*.patch                         Thunks.cpp: size + writeTo + conditional needsTocRestore
+  LICENSE                              Apache-2.0 with LLVM Exception
 cpu/
   scripts and docs for CPU-only TF build
 ```
