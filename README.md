@@ -13,7 +13,7 @@ Build TensorFlow 2.21 from source on IBM POWER9 with NVIDIA Tesla V100 GPU suppo
 ## Quick start
 
 ```bash
-bash lld-ppc64-fix/build_patched_lld.sh        # ~3h, patched LLD for PPC64LE
+bash lld-ppc64le-fix/build_patched_lld.sh        # ~3h, patched LLD for PPC64LE
 bash gpu/tensorflow_gpu.sh                     # main TF build (~3h-6h)
 python3 gpu/gpu_test_suite.py                  # functional test suite
 ```
@@ -22,11 +22,11 @@ python3 gpu/gpu_test_suite.py                  # functional test suite
 
 ### 1. PPC64LE multi-TOC `r2` corruption (LLD patch)
 
-`lld-ppc64-fix/build_patched_lld.sh` patches LLD with:
+`lld-ppc64le-fix/build_patched_lld.sh` patches LLD with:
 - `PPC64LongBranchThunk` prefixed with `std r2,24(r1)` (multi-TOC fix)
 - `setNeedsTocRestore(true)` only when callee may clobber `r2` (global entry or `.localentry=1`), so LLD auto-patches the trailing `nop` to `ld r2,24(r1)` while keeping the upstream `"lacks nop"` diagnostic correct for leaf callees
 
-Upstreamable as a single PR. See `lld-ppc64-fix/README.md` for full details.
+Upstreamable as a single PR. See `lld-ppc64le-fix/README.md` for full details.
 
 ### 2. cuDNN 9 headers enforced
 
@@ -75,7 +75,7 @@ gpu/
   gpu_test_suite.py                    76 functional tests covering all TF surfaces
   transfer.sh                          rotating diagnostic / transfer helper
   patch_nv_toc_save.py                 obsolete patcher v6 (kept for reference)
-lld-ppc64-fix/                          standalone, see lld-ppc64-fix/README.md
+lld-ppc64le-fix/                          standalone, see lld-ppc64le-fix/README.md
   build_patched_lld.sh                 patched LLD for PPC64LE
   test_lld.sh                          8 LLD validation tests
   0001-*.patch                         Thunks.cpp: size + writeTo + conditional needsTocRestore

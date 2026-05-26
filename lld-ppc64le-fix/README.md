@@ -1,4 +1,4 @@
-# lld-ppc64-fix
+# lld-ppc64le-fix
 
 A patched build of LLVM `ld.lld` that fixes a latent **r2 (TOC pointer)
 corruption** in upstream LLD's `PPC64LongBranchThunk` path. Affects any
@@ -247,7 +247,7 @@ limitation, not specific to this patch.
 ## Layout
 
 ```
-lld-ppc64-fix/
+lld-ppc64le-fix/
 ├── build_patched_lld.sh                          build entry point
 ├── test_lld.sh                                   T1..T4 validation tests
 ├── 0001-lld-PPC64-Add-r2-TOC-save-to-LongBranch-thunks.patch
