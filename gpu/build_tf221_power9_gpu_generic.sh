@@ -4,7 +4,7 @@
 #
 # Architectural decisions specific to PPC64LE:
 #
-#   1. Linker: patched LLD (lld-ppc64-fix/) with r2-save in LongBranchThunks
+#   1. Linker: patched LLD (lld-ppc64le-fix/) with r2-save in LongBranchThunks
 #      and 'lacks nop' error suppressed for libgcc compat.
 #
 #   2. Host assembler: Clang from conda env (gcc_cuda_wrapper.sh redirects to
@@ -3926,7 +3926,7 @@ sed -i 's/3\.5/7.0/g' .tf_configure.bazelrc 2>/dev/null || true
 sed -i '/fuse-ld=gold/d' .tf_configure.bazelrc 2>/dev/null || true
 sed -i '/use-gold-linker/d' .tf_configure.bazelrc 2>/dev/null || true
 
-# Linker: patched LLD with the multi-TOC r2 save fix (see lld-ppc64-fix/ for
+# Linker: patched LLD with the multi-TOC r2 save fix (see lld-ppc64le-fix/ for
 # the standalone artifact — 3 edits to lld/ELF/Thunks.cpp that emit
 # std r2,24(r1) in PPC64LongBranchThunk + conditional needsTocRestore based
 # on destination st_other). Falls back to Conda's stock LLD if the patched
@@ -3958,7 +3958,7 @@ echo ">>> Linker selected for Bazel: -fuse-ld=${BAZEL_FUSE_LD}"
 #   - conda's libgcc.a was compiled with -fno-plt and emits these helpers with
 #     a non-zero st_other (global entry / CLOBBERS_R2 marker).
 #   - Our patched LLD's conditional needsTocRestore (patch [3] in
-#     lld-ppc64-fix/) correctly treats those callees as r2-clobbering and
+#     lld-ppc64le-fix/) correctly treats those callees as r2-clobbering and
 #     expects a trailing nop after every bl that targets them.
 #   - libgcc's own callers (e.g. __floatunditf -> _restfpr_30) lack that nop
 #     => link fails with "call to _restfpr_30 lacks nop, can't restore toc".
